@@ -1,6 +1,6 @@
 #:schema https://www.schemastore.org/cargo.json
 [package]
-name = "tray"
+name = "siphon"
 version = "0.1.2"
 description = "A twtich notifier"
 authors = ["Ozeniken"]
