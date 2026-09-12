@@ -19,7 +19,6 @@ jobs:
           version: 12
           runtime: "node@lts"
           cache: true
-          require-lockfile: true
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
