@@ -1,0 +1,96 @@
+#:schema https://www.schemastore.org/cargo.json
+[package]
+name = "tray"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "try_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+notify-rust = { version = "4", features = ["async"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["time", "sync", "macros"] }
+futures-util = { version = "0.3", default-features = false, features = [
+  "std",
+  "sink",
+] }
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = [
+  "client",
+  "http1",
+] }
+hyper-util = { version = "0.1", default-features = false, features = [
+  "client-legacy",
+  "http1",
+  "tokio",
+] }
+hyper-rustls = { version = "0.27", default-features = false, features = [
+  "http1",
+  "tls12",
+  "ring",
+  "webpki-roots",
+  "native-tokio",
+] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+
+# NOTE: [profile.release] lives in the workspace root; cargo ignores profiles
+# in member manifests.
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = "2"
+
+[target."cfg(windows)".dependencies]
+winreg = "0.55"
+tauri-winrt-notification = "0.7"
+
+# Keep in sync with [workspace.lints] in the root Cargo.toml.
+# Cargo requires that `lints.workspace = true` be the only table entry, so this
+# crate spells out the workspace base itself plus its own overrides below.
+# NOTE: only [lints.rust] and [lints.clippy] are needed here; [lints] cannot use
+# inheritance at the same time.
+[lints.rust]
+warnings = "deny"
+future_incompatible = { level = "deny", priority = -1 }
+nonstandard_style = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+rust_2021_compatibility = { level = "deny", priority = -1 }
+rust_2024_compatibility = { level = "deny", priority = -1 }
+unused = { level = "deny", priority = -1 }
+
+unsafe_op_in_unsafe_fn = "deny"
+unused_qualifications = "warn"
+variant_size_differences = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+multiple_unsafe_ops_per_block = "deny"
+str_to_string = "warn"
+missing_errors_doc = "allow"
+too_many_lines = "allow"
+
+# Tray-specific overrides
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+missing_panics_doc = "allow"
