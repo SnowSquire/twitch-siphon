@@ -1,9 +1,10 @@
 #:schema https://www.schemastore.org/cargo.json
 [package]
 name = "tray"
-version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+version = "0.1.2"
+description = "A twtich notifier"
+authors = ["Ozeniken"]
+license = "Apache-2.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -47,6 +48,8 @@ hyper-rustls = { version = "0.27", default-features = false, features = [
   "native-tokio",
 ] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tauri-plugin-log = "2"
+log = "0.4"
 
 # NOTE: [profile.release] lives in the workspace root; cargo ignores profiles
 # in member manifests.
@@ -58,11 +61,6 @@ tauri-plugin-single-instance = "2"
 winreg = "0.55"
 tauri-winrt-notification = "0.7"
 
-# Keep in sync with [workspace.lints] in the root Cargo.toml.
-# Cargo requires that `lints.workspace = true` be the only table entry, so this
-# crate spells out the workspace base itself plus its own overrides below.
-# NOTE: only [lints.rust] and [lints.clippy] are needed here; [lints] cannot use
-# inheritance at the same time.
 [lints.rust]
 warnings = "deny"
 future_incompatible = { level = "deny", priority = -1 }

@@ -1,7 +1,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Backend log helper. Routes through the `log` crate so records fan out
+/// to the tauri-plugin-log targets (stdout + webview console).
+/// `module` becomes the log target, e.g. `log::info!(target: "hermes", …)`.
 pub fn log(module: &str, message: impl std::fmt::Display) {
-    eprintln!("[{ts}][{module}] {message}", ts = timestamp());
+    log::info!(target: module, "{message}");
 }
 
 /// RFC 3339 UTC timestamp, matching the TS client's `toISOString()` output.

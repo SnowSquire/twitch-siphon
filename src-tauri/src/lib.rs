@@ -17,8 +17,6 @@ use crate::logging::log;
 
 struct AppState {
     config_path: PathBuf,
-    // the in-memory config is the source of truth; every mutation command
-    // updates it, persists it to disk and forwards a hermes command
     config: Mutex<Config>,
     hermes_tx: tokio::sync::mpsc::UnboundedSender<hermes::Command>,
     status: Mutex<Option<hermes::StatusEvent>>,
@@ -73,6 +71,7 @@ async fn add_channel(state: State<'_, AppState>, login: String) -> Result<(), St
             None
         }
     };
+
     if let Some(channel) = resolved {
         let entry = ChannelEntry {
             login: channel.login.clone(),
@@ -158,8 +157,19 @@ impl AppState {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .clear_targets()
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Stdout,
+                ))
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Webview,
+                ))
+                .level(log::LevelFilter::Debug)
+                .build(),
+        )
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // a second instance was launched: focus the existing window instead
             show_window(app);
         }))
         .plugin(tauri_plugin_opener::init())
