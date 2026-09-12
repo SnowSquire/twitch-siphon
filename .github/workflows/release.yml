@@ -37,3 +37,15 @@ jobs:
           releaseBody: "See the assets to download and install."
           releaseDraft: true
           prerelease: false
+          args: --bundles nsis
+
+      - name: prepare portable binary
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          Copy-Item "src-tauri/target/release/tray.exe" "Siphon_${version}_x64-portable.exe"
+
+      - name: upload portable binary
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: Siphon_*-portable.exe
