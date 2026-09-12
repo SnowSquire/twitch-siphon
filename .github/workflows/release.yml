@@ -23,6 +23,11 @@ jobs:
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -30,5 +35,5 @@ jobs:
           tagName: v__VERSION__
           releaseName: "Siphon v__VERSION__"
           releaseBody: "See the assets to download and install."
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
