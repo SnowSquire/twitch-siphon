@@ -152,13 +152,9 @@ async fn resolve_image(image: Option<&str>) -> Option<String> {
             return None;
         }
     }
-    // notify-rust takes paths as &str; bail out of impossibly-named temp dirs
     path.into_os_string().into_string().ok()
 }
 
-/// "Silent" intentionally fails `Sound::from_str(..)`; notify-rust maps the
-/// failed parse to no sound at all, which is exactly the silent toast.
-///
 /// When `login` is `Some`, clicking the toast body (or the Watch button)
 /// opens that channel in the default browser. Only the login is stored; the
 /// url is built at click time. Toasts never expire on their own: they use the

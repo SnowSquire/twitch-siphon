@@ -20,8 +20,6 @@ fn client() -> Result<cyper::Client, Error> {
     Ok(cyper::Client::new()?)
 }
 
-// The full user record: ids and start times are stored for future use
-// (history/dedup) even though notifications only read a subset.
 const USERS_BY_IDS_QUERY: &str = "query UsersByIds($ids:[ID!]){users(ids:$ids){id login displayName profileImageURL(width:70) broadcastSettings{id title game{id name displayName}}stream{id createdAt}}}";
 const USERS_BY_LOGINS_QUERY: &str = "query UsersByLogins($logins:[String!]){users(logins:$logins){id login displayName profileImageURL(width:70) broadcastSettings{id title game{id name displayName}}stream{id createdAt}}}";
 
@@ -44,7 +42,7 @@ pub struct User {
     pub profile_image_url: String,
     pub stream_id: u64,
     pub stream_title: Option<String>,
-    // millisseconds since 1970, technically should be in sync with live but we don't get them at the same time so  they are separate
+    /// Milliseconds since the unix epoch; `None` when offline.
     pub stream_start: Option<i64>,
     pub game: Option<Game>,
     pub live: bool,
@@ -125,8 +123,6 @@ where
 }
 
 impl GqlUser {
-    // Same filtering the `Value` version did: unknown ids/titles/games
-    // yield `None` (user skipped), everything else fills the domain type.
     fn into_user(self) -> Option<User> {
         let broadcast = self.broadcast?;
         Some(User {
@@ -194,8 +190,7 @@ pub async fn fetch_users(ids: &[u64], logins: &[String]) -> Result<Vec<User>, Er
         .await
         .map_err(|_| "gql body read timed out")??;
     // Single-pass typed decode: no intermediate `Value` map. A shape
-    // mismatch is a real error now (surfaced to the caller) instead of a
-    // silent empty list; per-user gaps still collapse to `None` above.
+    // mismatch surfaces to the caller; per-user gaps still collapse to `None` above.
     let responses: Vec<GqlOperationResponse> = serde_json::from_slice(&body)?;
     let users = responses
         .into_iter()

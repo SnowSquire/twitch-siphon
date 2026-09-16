@@ -49,7 +49,6 @@ pub struct GuiWaker {
 }
 
 impl GuiWaker {
-    // Cheap handle construction (`Arc` + `OnceLock`); cannot be `const`.
     #[allow(clippy::missing_const_for_fn)]
     pub fn new() -> Self {
         Self {
@@ -95,8 +94,6 @@ pub struct WorkState {
     waker: GuiWaker,
 }
 
-/// Everything one intent needs persisted: the config snapshot plus the
-/// hermes command to forward once the write lands.
 struct PendingSave {
     path: Rc<PathBuf>,
     config: Rc<Config>,
@@ -121,21 +118,15 @@ impl WorkState {
         }
     }
 
-    /// Non-blocking drain of pending UI intents, oldest first.
     pub fn drain_intents(&self) -> Vec<UiIntent> {
         self.ui_rx.try_iter().collect()
     }
 
-    /// Sends the startup commands hermes needs: one add per configured
-    /// channel plus the saved preferences, then the first frame.
+    pub fn config_snapshot(&self) -> Rc<Config> {
+        Rc::clone(&self.config)
+    }
+
     pub fn seed(&self) {
-        for channel in &self.config.channels {
-            self.forward(hermes::Command::AddChannel(channel.login.clone()));
-        }
-        self.forward(hermes::Command::SetNotifyTitleChanges(
-            self.config.notify_title_changes,
-        ));
-        self.forward(hermes::Command::SetSound(self.config.sound));
         self.push_frame();
     }
 
@@ -227,8 +218,6 @@ impl WorkState {
         Self::commit_save(work, Some(pending)).await;
     }
 
-    /// Everything one intent needs persisted: the config snapshot plus the
-    /// hermes command to forward once the write lands.
     fn stage_save(&mut self, forward: hermes::Command) -> PendingSave {
         Rc::make_mut(&mut self.config).version = Config::VERSION;
         PendingSave {
@@ -561,7 +550,6 @@ mod tests {
 
         block_on(async {
             compio::fs::remove_file(&path).await.ok();
-            // Seed the file first so prune has something to rewrite.
             work.borrow().config.save(&path).await.unwrap();
             WorkState::apply_prune_ids(&work, &[1]).await;
 

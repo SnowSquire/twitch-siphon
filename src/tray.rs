@@ -1,6 +1,6 @@
 //! System tray via the standalone `tray-icon` crate (the same code Tauri
 //! wraps — no Tauri needed). Menu holds Open/Quit; left-click shows the
-//! window without opening the menu, matching the old behavior.
+//! window without opening the menu.
 //!
 //! Linux uses `tray-icon`'s `ksni` backend (pure-Rust `StatusNotifierItem` over
 //! D-Bus): no GTK, no system tray dev-packages, no event-loop thread to host.
@@ -72,9 +72,8 @@ pub fn build() -> Result<Tray, String> {
     Ok(Tray { _icon: icon })
 }
 
-/// Non-blocking drain of pending tray/menu events, oldest first. Called by
-/// the work thread's poll task on a short interval; the global receivers
-/// never disconnect in practice, so an empty vec simply means idle.
+/// Non-blocking drain of pending tray/menu events. The global receivers
+/// never disconnect, so an empty vec means idle.
 pub fn drain_pending() -> Vec<TrayAction> {
     let mut actions = Vec::new();
     for event in TrayIconEvent::receiver().try_iter() {

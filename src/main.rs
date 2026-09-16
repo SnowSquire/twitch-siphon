@@ -1,4 +1,4 @@
-// Prevents additional console window on Windows in release, DO NOT REMOVE!!
+// No console window in release on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
@@ -18,8 +18,7 @@ use crate::config::Config;
 use crate::state::{FrameState, GuiWaker, UiIntent, WorkContext};
 use crate::tray::TrayAction;
 
-/// Former Tauri bundle id; doubles as the single-instance key and the
-/// config directory name so existing installs keep their config.
+/// Single-instance key and config directory name.
 const APP_ID: &str = "com.iken.siphon";
 
 fn main() {
@@ -114,8 +113,6 @@ fn main() {
         "Siphon",
         options,
         Box::new(move |cc| {
-            // Raw Win32 handle for ShowWindow hide/show (emilk/egui#737);
-            // `None` off Windows, where viewport commands suffice.
             let hwnd = cc
                 .window_handle()
                 .ok()
@@ -124,7 +121,6 @@ fn main() {
                     _ => None,
                 });
             log::info!(target: "app", "creator closure running, hwnd={hwnd:?}");
-            // No tray (failed build) means close quits instead of hiding.
             let tray = match tray::build() {
                 Ok(tray) => Some(tray),
                 Err(error) => {

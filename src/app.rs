@@ -1,4 +1,4 @@
-//! egui UI: immediate-mode port of the old Solid frontend. The GUI thread is
+//! egui UI. The GUI thread is
 //! purely presentational: it renders the latest [`FrameState`] pushed by the
 //! work thread and sends [`UiIntent`]s back. No `Arc`, no `Mutex` here.
 
@@ -32,7 +32,6 @@ pub struct SiphonApp {
 }
 
 impl SiphonApp {
-    // Takes owning channel ends and guards; cannot be `const`.
     #[allow(clippy::missing_const_for_fn)]
     pub fn new(
         ui_tx: Sender<UiIntent>,
@@ -106,9 +105,7 @@ impl SiphonApp {
     }
 
     fn render(&mut self, ui: &mut egui::Ui) {
-        // Owned per-frame copies (as the old snapshots were): the `show`
-        // closure below calls `&mut self` methods, so it cannot borrow
-        // `self.frame` at the same time.
+        // Cloned: `show` calls `&mut self` methods, blocking a borrow of `self.frame`.
         let config = self.frame.config.clone();
         let status = self.frame.status.clone();
         let error = self.frame.error.clone();
@@ -210,8 +207,7 @@ impl eframe::App for SiphonApp {
             log::info!(target: "single", "wake received, showing window");
             self.show(ctx);
         }
-        // Drain to latest action is unnecessary here: each action is a real
-        // user gesture, so handle every queued one in order.
+        // Every queued action is a user gesture; handle each in order.
         while let Ok(action) = self.tray_rx.try_recv() {
             match action {
                 TrayAction::Show => {
@@ -267,8 +263,7 @@ fn sub_badge(ui: &mut egui::Ui, state: SubStatus) {
     badge(ui, text, color);
 }
 
-/// Visibility toggle for our own window. `ViewportCommand::Visible` hides
-/// fine but doesn't reliably re-show (emilk/egui#737), hence Win32 here.
+/// Visibility toggle for our own window.
 #[cfg(windows)]
 fn set_visible(hwnd: isize, cmd: i32) {
     // SAFETY: `hwnd` is the live eframe window captured at startup;

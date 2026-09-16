@@ -24,11 +24,6 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
 const KEEPALIVE_MISSED_LIMIT: u64 = 2;
 const TOPIC_PREFIXES: [&str; 2] = ["broadcast-settings-update", "video-playback-by-id"];
 
-/// One imperative mutation, sent by the ui layer instead of diffing whole
-/// settings snapshots against the session state. Adds carry only the login
-/// (the only thing the UI knows); removes carry the resolved id. Only
-/// resolved channels are ever tracked — unresolvable logins are dropped and
-/// surfaced as errors, never stored.
 pub enum Command {
     AddChannel(String),
     RemoveChannel(u64),
@@ -196,14 +191,21 @@ struct Session {
 
 impl Session {
     fn new(work: Rc<RefCell<WorkState>>, command_rx: mpsc::UnboundedReceiver<Command>) -> Self {
+        let (notify_title_changes, sound) = {
+            let work = work.borrow();
+            (
+                work.config_snapshot().notify_title_changes,
+                work.config_snapshot().sound,
+            )
+        };
         Self {
             work,
             command_rx,
             channels: HashMap::new(),
             subs: HashMap::new(),
             preferences: Preferences {
-                notify_title_changes: true,
-                sound: true,
+                notify_title_changes,
+                sound,
             },
             socket: None,
             welcomed: false,
@@ -224,8 +226,6 @@ impl Session {
             if self.socket.is_none() && self.has_work() && Instant::now() >= self.reconnect_at {
                 self.connect().await;
             }
-            // When disconnected there is no socket to poll, so park that
-            // branch on a never-resolving future until the next connect.
             let command_fut = self.command_rx.next().fuse();
             let socket_fut = async {
                 match self.socket.as_mut() {
@@ -242,9 +242,7 @@ impl Session {
                     self.on_command(command).await;
                 }
                 message = socket_fut => {
-                    // Convert to an owned event first so the tungstenite
-                    // `Message` (which owns refcounted bytes) is dropped
-                    // before any await below runs.
+                    // `Message` owns refcounted bytes; drop before awaits below.
                     enum SocketEvent {
                         Text(compio::ws::tungstenite::Utf8Bytes),
                         Closed,
@@ -255,7 +253,6 @@ impl Session {
                             log::info!(target: "hermes", "server sent close frame");
                             SocketEvent::Closed
                         }
-                        // Text and binary frames carry the same json payloads.
                         Some(Ok(message)) => message
                             .into_text()
                             .map_or_else(|_| SocketEvent::Ignored, SocketEvent::Text),
@@ -285,9 +282,10 @@ impl Session {
         }
     }
 
-    /// Channels exist that could be subscribed once resolved.
+    /// Anything to subscribe to. The session map stays empty until the first
+    /// `connect` populates it, so the persisted list is checked as well.
     fn has_work(&self) -> bool {
-        !self.channels.is_empty()
+        !self.channels.is_empty() || !self.work.borrow().config_snapshot().channels.is_empty()
     }
 
     /// Applies one ui mutation. Additions are subscribed on the live
@@ -318,9 +316,6 @@ impl Session {
         }
         log::info!(target: "hermes", "channel {login} added");
         // One targeted fetch seeds the notify baseline (title/game/live).
-        // The bridge may have fetched already for its persist decision; this
-        // second fetch is deliberate (baseline seeding is this task's job)
-        // and costs one request per explicit user add.
         match gql::fetch_users(&[], std::slice::from_ref(&login)).await {
             Ok(mut users) => {
                 let user = users
@@ -389,10 +384,18 @@ impl Session {
     }
 
     async fn connect(&mut self) {
-        // One batch fetch refreshes the notify baseline, so every
-        // (re)connect starts from fresh gql state. Ids that no longer
-        // resolve are pruned from the persisted list instead of lingering.
-        let ids: Vec<u64> = self.channels.keys().copied().collect();
+        // One batched resolve per connect keeps the notify baseline fresh.
+        // Ids that resolve to nothing are pruned from the persisted list.
+        let ids: Vec<u64> = {
+            let config = self.work.borrow().config_snapshot();
+            let mut ids: Vec<u64> = config.channels.iter().map(|c| c.id).collect();
+            for id in self.channels.keys() {
+                if !ids.contains(id) {
+                    ids.push(*id);
+                }
+            }
+            ids
+        };
         self.sync(&ids).await;
         if self.channels.is_empty() {
             // Connecting with no subscribable channel would just time out.
@@ -548,8 +551,6 @@ impl Session {
         };
         match message["type"].as_str() {
             Some("welcome") => {
-                // a nonzero attempt count means this welcome followed at
-                // least one disconnect, so it is a reconnect
                 let summary = if self.reconnect_attempt == 0 {
                     "Hermes connected"
                 } else {
@@ -722,8 +723,6 @@ impl Session {
         };
         let title_changed = user.stream_title.as_deref() != Some(status.as_str());
         let game_changed = game.as_deref() != user.game.as_ref().map(|game| game.name.as_str());
-        // a local because nursery's suspicious_operation_groupings misfires
-        // when the two fields appear in one && chain
         let can_notify = self.preferences.notify_title_changes && !user.live;
         if can_notify && (title_changed || game_changed) {
             let mut lines = Vec::new();
@@ -750,7 +749,6 @@ impl Session {
             )
             .await;
         }
-        // mirrors the TS client's state updates for these events
         user.stream_title = Some(status).filter(|title| !title.is_empty());
         let game_display_name = user.game.as_ref().map(|game| game.display_name.clone());
         user.game = game.zip(pubsub["game_id"].as_u64()).map(|(name, id)| Game {
@@ -770,8 +768,7 @@ impl Session {
     async fn on_video_playback(&mut self, channel_id: u64, pubsub: &Value) {
         match pubsub["type"].as_str() {
             Some("stream-up") => {
-                // Optimistic: flip live and notify from the cached baseline
-                // first, so neither waits for the gql round-trip below.
+                // Notify from the cached baseline first; refresh from gql after.
                 let cached = self.channels.get_mut(&channel_id).map(|user| {
                     user.live = true;
                     (
@@ -797,8 +794,6 @@ impl Session {
                 } else {
                     false
                 };
-                // Refresh the details before returning; a channel unknown
-                // at event time still notifies here, as before.
                 match gql::fetch_users(&[channel_id], &[]).await {
                     Ok(users) => {
                         let Some(mut user) =
