@@ -1,12 +1,5 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Backend log helper. Routes through the `log` crate so records fan out
-/// to the configured sinks (stderr via `env_logger`).
-/// `module` becomes the log target, e.g. `log::info!(target: "hermes", …)`.
-pub fn log(module: &str, message: impl std::fmt::Display) {
-    log::info!(target: module, "{message}");
-}
-
 /// RFC 3339 UTC timestamp, matching the TS client's `toISOString()` output.
 pub fn timestamp() -> String {
     let elapsed = SystemTime::now()

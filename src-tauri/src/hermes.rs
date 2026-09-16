@@ -1,14 +1,17 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use compio::net::TcpStream;
-use compio::ws::{WebSocketStream, connect_async};
 use compio::ws::tungstenite::Message;
+use compio::ws::{connect_async, WebSocketStream};
 use futures_channel::mpsc;
-use futures_util::StreamExt;
-use serde_json::{Value, json};
+use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt as _, StreamExt as _};
+use serde_json::{json, Value};
 
 use crate::gql::{self, Game, User};
 use crate::notifier;
@@ -21,19 +24,14 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
 const KEEPALIVE_MISSED_LIMIT: u64 = 2;
 const TOPIC_PREFIXES: [&str; 2] = ["broadcast-settings-update", "video-playback-by-id"];
 
-/// A channel as configured. `id` is None when gql has not resolved the login
-/// yet; those entries cannot be subscribed and show up as unresolved.
-pub struct ChannelEntry {
-    pub login: String,
-    pub id: Option<u64>,
-    pub display_name: Option<String>,
-}
-
 /// One imperative mutation, sent by the ui layer instead of diffing whole
-/// settings snapshots against the session state.
+/// settings snapshots against the session state. Adds carry only the login
+/// (the only thing the UI knows); removes carry the resolved id. Only
+/// resolved channels are ever tracked — unresolvable logins are dropped and
+/// surfaced as errors, never stored.
 pub enum Command {
-    AddChannel(ChannelEntry),
-    RemoveChannel(String),
+    AddChannel(String),
+    RemoveChannel(u64),
     SetNotifyTitleChanges(bool),
     SetSound(bool),
 }
@@ -61,43 +59,11 @@ pub struct ChannelStatus {
     pub live_status: SubStatus,
 }
 
-/// Snapshot of everything the ui needs to render the channel list and the
-/// connection state; the work thread wraps it in a [`FrameState`](crate::state::FrameState)
-/// and pushes it to the GUI on every change.
 #[derive(Clone)]
-pub struct StatusEvent {
+pub struct StatusSnapshot {
     pub connected: bool,
     pub error: Option<String>,
     pub channels: Vec<ChannelStatus>,
-    pub unresolved: Vec<String>,
-}
-
-/// Everything hermes tracks per channel: rendering data plus the notify
-/// baseline (title/game/live) refreshed by gql and patched by pubsub.
-/// Stream id/start and full game info are stored alongside for future use.
-struct Tracked {
-    login: String,
-    display_name: String,
-    avatar: String,
-    title: Option<String>,
-    game: Option<Game>,
-    live: bool,
-}
-
-impl Tracked {
-    fn placeholder(entry: &ChannelEntry) -> Self {
-        Self {
-            login: entry.login.clone(),
-            display_name: entry
-                .display_name
-                .clone()
-                .unwrap_or_else(|| entry.login.clone()),
-            avatar: String::new(),
-            title: None,
-            game: None,
-            live: false,
-        }
-    }
 }
 
 struct Sub {
@@ -111,67 +77,98 @@ type WsStream = WebSocketStream<TcpStream>;
 /// events). Bounds click-to-effect latency; the runtime otherwise sleeps.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Runs the whole work side on its own OS thread owning a compio runtime:
-/// the hermes session task plus a poll task that bridges the sync inboxes
-/// (GUI intents, tray events) into it. Everything on this thread is
-/// single-threaded (`Rc`, no `Mutex`); crossbeam channels are the only
-/// bridge to the GUI thread.
-pub fn spawn(ctx: WorkContext) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("hermes".to_owned())
-        .spawn(move || {
-            compio::runtime::Runtime::new()
-                .expect("compio runtime")
-                .block_on(async move {
-                    let (session_tx, command_rx) = mpsc::unbounded();
-                    let work = Rc::new(RefCell::new(WorkState::new(ctx, session_tx)));
-                    work.borrow().seed();
-                    // Detached: both tasks run until the runtime drops with
-                    // the process; there is nothing to join or cancel.
-                    let _poll: compio::runtime::JoinHandle<()> =
-                        compio::runtime::spawn(poll_loop(Rc::clone(&work)));
-                    let mut session = Session::new(work, command_rx);
-                    session.main_loop().await;
-                });
-        })
-        .expect("hermes thread")
+/// One finished channel resolve: the login plus the gql result.
+type ResolveDone = (String, Result<Vec<User>, gql::Error>);
+/// In-flight resolve future. `!Send` is fine: everything stays on this one
+/// thread-per-core runtime thread.
+type ResolveFuture = Pin<Box<dyn Future<Output = ResolveDone>>>;
+
+/// Drives the whole work side on the calling thread, which must be a
+/// dedicated OS thread owning this compio runtime: the hermes session plus a
+/// poll routine that bridges the sync inboxes (GUI intents, tray events) into
+/// it. Everything here is single-threaded (`Rc`, no `Mutex`); crossbeam
+/// channels are the only bridge to the GUI thread.
+///
+/// This function never returns (both routines run until the process exits);
+/// the caller owns thread creation so this module never spawns anything.
+pub fn run(ctx: WorkContext) {
+    compio::runtime::Runtime::new()
+        .expect("compio runtime")
+        .block_on(async move {
+            let (session_tx, command_rx) = mpsc::unbounded();
+            let work = Rc::new(RefCell::new(WorkState::new(ctx, session_tx)));
+            work.borrow().seed();
+            let mut session = Session::new(Rc::clone(&work), command_rx);
+            // Joined, not spawned: both routines are polled on this one
+            // thread until the process exits.
+            futures_util::future::join(poll_loop(work), session.main_loop()).await;
+        });
 }
 
 /// Bridges the sync inboxes into the runtime: drains UI intents and tray
 /// events with non-blocking `try_recv` on a short interval, so neither the
 /// GUI thread nor this runtime ever blocks. Intent handling is synchronous;
-/// resolves run as spawned tasks on this same runtime.
+/// resolves wait in a `FuturesUnordered` polled by this same routine, so no
+/// task is ever spawned.
+///
+/// The `select!` over the boxed resolve stream trips `tail_expr_drop_order`
+/// (boxed `dyn Future` counts as a custom destructor); drop order is
+/// irrelevant here, and the crate is edition 2021, so the lint is allowed
+/// locally instead of restructuring the poll.
+#[allow(tail_expr_drop_order)]
 async fn poll_loop(work: Rc<RefCell<WorkState>>) {
     let mut tick = compio::time::interval(POLL_INTERVAL);
+    let mut pending: FuturesUnordered<ResolveFuture> = FuturesUnordered::new();
     loop {
-        tick.tick().await;
-        for intent in work.borrow().drain_intents() {
-            match intent {
-                UiIntent::AddLogin(login) => {
-                    if let Some(login) = work.borrow_mut().begin_add_login(&login) {
-                        let resolved = Rc::clone(&work);
-                        let _resolve: compio::runtime::JoinHandle<()> =
-                            compio::runtime::spawn(async move {
-                                let users =
-                                    gql::fetch_users(&[], std::slice::from_ref(&login)).await;
-                                resolved.borrow_mut().finish_add_login(login, users);
-                            });
+        if pending.is_empty() {
+            tick.tick().await;
+            drain_once(&work, &pending).await;
+        } else {
+            let tick_fut = tick.tick().fuse();
+            let next_fut = pending.next().fuse();
+            futures_util::pin_mut!(tick_fut, next_fut);
+            futures_util::select! {
+                _ = tick_fut => {
+                    drain_once(&work, &pending).await;
+                }
+                done = next_fut => {
+                    if let Some((login, result)) = done {
+                        WorkState::finish_add_login(&work, login, result).await;
                     }
-                }
-                UiIntent::RemoveLogin(login) => {
-                    work.borrow_mut().apply_remove_login(&login);
-                }
-                UiIntent::SetNotifyTitleChanges(value) => {
-                    work.borrow_mut().apply_notify_title_changes(value);
-                }
-                UiIntent::SetSound(value) => {
-                    work.borrow_mut().apply_sound(value);
                 }
             }
         }
-        for action in tray::drain_pending() {
-            work.borrow().forward_tray(action);
+    }
+}
+
+/// One poll tick: drains UI intents (queuing resolves instead of spawning
+/// them) and tray events.
+async fn drain_once(work: &Rc<RefCell<WorkState>>, pending: &FuturesUnordered<ResolveFuture>) {
+    // Owned up front: the `Ref` must not survive into the awaits below.
+    let intents: Vec<UiIntent> = work.borrow().drain_intents();
+    for intent in intents {
+        match intent {
+            UiIntent::AddLogin(login) => {
+                if let Some(login) = work.borrow_mut().begin_add_login(&login) {
+                    pending.push(Box::pin(async move {
+                        let users = gql::fetch_users(&[], std::slice::from_ref(&login)).await;
+                        (login, users)
+                    }));
+                }
+            }
+            UiIntent::RemoveChannel(id) => {
+                WorkState::apply_remove_channel(work, id).await;
+            }
+            UiIntent::SetNotifyTitleChanges(value) => {
+                WorkState::apply_notify_title_changes(work, value).await;
+            }
+            UiIntent::SetSound(value) => {
+                WorkState::apply_sound(work, value).await;
+            }
         }
+    }
+    for action in tray::drain_pending() {
+        work.borrow().forward_tray(action);
     }
 }
 
@@ -184,8 +181,7 @@ struct Preferences {
 struct Session {
     work: Rc<RefCell<WorkState>>,
     command_rx: mpsc::UnboundedReceiver<Command>,
-    channels: HashMap<u64, Tracked>,
-    unresolved: Vec<String>,
+    channels: HashMap<u64, User>,
     subs: HashMap<String, Sub>,
     preferences: Preferences,
     socket: Option<WsStream>,
@@ -204,7 +200,6 @@ impl Session {
             work,
             command_rx,
             channels: HashMap::new(),
-            unresolved: Vec::new(),
             subs: HashMap::new(),
             preferences: Preferences {
                 notify_title_changes: true,
@@ -223,7 +218,6 @@ impl Session {
     }
 
     async fn main_loop(&mut self) {
-        use futures_util::FutureExt as _;
         log::info!(target: "hermes", "worker started");
         let mut tick = compio::time::interval(Duration::from_secs(1));
         loop {
@@ -293,7 +287,7 @@ impl Session {
 
     /// Channels exist that could be subscribed once resolved.
     fn has_work(&self) -> bool {
-        !self.channels.is_empty() || !self.unresolved.is_empty()
+        !self.channels.is_empty()
     }
 
     /// Applies one ui mutation. Additions are subscribed on the live
@@ -301,8 +295,8 @@ impl Session {
     /// The socket itself is never restarted for config changes.
     async fn on_command(&mut self, command: Command) {
         match command {
-            Command::AddChannel(entry) => self.add_channel(entry).await,
-            Command::RemoveChannel(login) => self.remove_channel(&login).await,
+            Command::AddChannel(login) => self.add_channel(login).await,
+            Command::RemoveChannel(id) => self.remove_channel(id).await,
             Command::SetNotifyTitleChanges(value) => {
                 log::info!(target: "hermes", "notify_title_changes={value}");
                 self.preferences.notify_title_changes = value;
@@ -314,68 +308,43 @@ impl Session {
         }
     }
 
-    async fn add_channel(&mut self, entry: ChannelEntry) {
+    async fn add_channel(&mut self, login: String) {
         if self
             .channels
             .values()
-            .any(|tracked| tracked.login.eq_ignore_ascii_case(&entry.login))
-            || self
-                .unresolved
-                .iter()
-                .any(|login| login.eq_ignore_ascii_case(&entry.login))
+            .any(|user| user.channel_name.eq_ignore_ascii_case(&login))
         {
             return;
         }
-        log::info!(target: "hermes", "channel {} added", entry.login);
-        // One targeted fetch seeds the notify baseline (title/game/live)
-        // and resolves a bare login to its id in the same response. The
-        // bridge may have fetched already for its persist decision; this
+        log::info!(target: "hermes", "channel {login} added");
+        // One targeted fetch seeds the notify baseline (title/game/live).
+        // The bridge may have fetched already for its persist decision; this
         // second fetch is deliberate (baseline seeding is this task's job)
         // and costs one request per explicit user add.
-        let ids = entry.id.into_iter().collect::<Vec<_>>();
-        let logins = entry
-            .id
-            .map_or_else(|| vec![entry.login.clone()], |_| Vec::new());
-        match gql::fetch_users(&ids, &logins).await {
-            Ok(users) => {
-                let user = users.into_iter().find(|user| {
-                    entry.id.is_some_and(|id| user.channel_id == id)
-                        || user.channel_name.eq_ignore_ascii_case(&entry.login)
-                });
-                match (user, entry.id) {
-                    (Some(user), _) => {
-                        self.unresolved
-                            .retain(|login| !login.eq_ignore_ascii_case(&entry.login));
-                        let id = user.channel_id;
-                        self.upsert(user);
-                        self.after_resolve(id).await;
-                    }
-                    (None, Some(id)) => {
-                        self.channels.insert(id, Tracked::placeholder(&entry));
-                        self.after_resolve(id).await;
-                    }
-                    (None, None) => {
-                        log::info!(
-                            target: "hermes",
-                            "gql returned no channel named {}, is it a typo?",
-                            entry.login
-                        );
-                        self.unresolved.push(entry.login);
-                    }
+        match gql::fetch_users(&[], std::slice::from_ref(&login)).await {
+            Ok(mut users) => {
+                let user = users
+                    .pop()
+                    .filter(|user| user.channel_name.eq_ignore_ascii_case(&login));
+                if let Some(user) = user {
+                    let id = user.channel_id;
+                    self.upsert(user);
+                    self.after_resolve(id).await;
+                    self.emit_status(None);
+                } else {
+                    log::info!(
+                        target: "hermes",
+                        "gql returned no channel named {login}, is it a typo?"
+                    );
+                    self.emit_status(Some(&format!("channel {login} not found")));
+                    WorkState::apply_prune_login(&self.work, &login).await;
                 }
             }
             Err(error) => {
                 log::info!(target: "hermes", "failed to fetch channel: {error}");
-                match entry.id {
-                    Some(id) => {
-                        self.channels.insert(id, Tracked::placeholder(&entry));
-                        self.after_resolve(id).await;
-                    }
-                    None => self.unresolved.push(entry.login),
-                }
+                self.emit_status(Some(&format!("failed to fetch {login}: {error}")));
             }
         }
-        self.emit_status(None);
     }
 
     /// Registers the new channel's topics and subscribes them immediately
@@ -388,42 +357,43 @@ impl Session {
         }
     }
 
-    async fn remove_channel(&mut self, login: &str) {
-        self.unresolved
-            .retain(|unresolved| !unresolved.eq_ignore_ascii_case(login));
-        if let Some(id) = self
-            .channels
-            .iter()
-            .find(|(_, tracked)| tracked.login.eq_ignore_ascii_case(login))
-            .map(|(id, _)| *id)
-        {
-            if let Some(tracked) = self.channels.remove(&id) {
-                log::info!(target: "hermes", "channel {} removed", tracked.login);
-                for prefix in TOPIC_PREFIXES {
-                    let topic = format!("{prefix}.{id}");
-                    if let Some(sub) = self.subs.remove(&topic) {
-                        log::info!(target: "hermes", "unsubscribing from {topic}");
-                        let message_id = self.nano_id();
-                        self.send_message(&json!({
-                            "type": "unsubscribe",
-                            "id": message_id,
-                            "unsubscribe": { "id": sub.id },
-                            "timestamp": crate::logging::timestamp(),
-                        }))
-                        .await;
-                    }
+    async fn remove_channel(&mut self, id: u64) {
+        if let Some(user) = self.channels.remove(&id) {
+            log::info!(target: "hermes", "channel {} removed", user.channel_name);
+            for prefix in TOPIC_PREFIXES {
+                let topic = format!("{prefix}.{id}");
+                if let Some(sub) = self.subs.remove(&topic) {
+                    log::info!(target: "hermes", "unsubscribing from {topic}");
+                    let message_id = self.nano_id();
+                    self.send_message(&json!({
+                        "type": "unsubscribe",
+                        "id": message_id,
+                        "unsubscribe": { "id": sub.id },
+                        "timestamp": crate::logging::timestamp(),
+                    }))
+                    .await;
                 }
             }
         }
         self.emit_status(None);
     }
 
+    /// Drops one id's topics without touching the socket: the channel is
+    /// gone (deleted/renamed), so there is nothing to unsubscribe from that
+    /// the server would still recognize. Welcome replays never see it again.
+    fn drop_channel(&mut self, id: u64) {
+        self.channels.remove(&id);
+        for prefix in TOPIC_PREFIXES {
+            self.subs.remove(&format!("{prefix}.{id}"));
+        }
+    }
+
     async fn connect(&mut self) {
-        // One batch fetch resolves unknown logins and refreshes the notify
-        // baseline, so every (re)connect starts from fresh gql state.
+        // One batch fetch refreshes the notify baseline, so every
+        // (re)connect starts from fresh gql state. Ids that no longer
+        // resolve are pruned from the persisted list instead of lingering.
         let ids: Vec<u64> = self.channels.keys().copied().collect();
-        let logins: Vec<String> = self.unresolved.clone();
-        self.sync(&ids, &logins).await;
+        self.sync(&ids).await;
         if self.channels.is_empty() {
             // Connecting with no subscribable channel would just time out.
             log::info!(
@@ -449,21 +419,36 @@ impl Session {
         }
     }
 
-    /// Merges one gql response into the tracked state: unresolved logins
-    /// that came back gain their channel, every returned channel refreshes
-    /// its baseline and gains its two subscription entries.
-    async fn sync(&mut self, ids: &[u64], logins: &[String]) {
-        if ids.is_empty() && logins.is_empty() {
+    /// Merges one gql response into the tracked state: every returned
+    /// channel refreshes its baseline and gains its two subscription
+    /// entries. Ids that resolve to nothing are dropped from the session
+    /// and pruned from the persisted list with an error, instead of
+    /// lingering as fake entries.
+    async fn sync(&mut self, ids: &[u64]) {
+        if ids.is_empty() {
             return;
         }
-        match gql::fetch_users(ids, logins).await {
+        match gql::fetch_users(ids, &[]).await {
             Ok(users) => {
+                let mut seen = std::collections::HashSet::with_capacity(users.len());
                 for user in users {
-                    self.unresolved
-                        .retain(|login| !login.eq_ignore_ascii_case(&user.channel_name));
+                    seen.insert(user.channel_id);
                     let id = user.channel_id;
                     self.upsert(user);
                     self.ensure_subs(id);
+                }
+                let missing: Vec<u64> = ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !seen.contains(id))
+                    .collect();
+                for id in &missing {
+                    log::info!(target: "hermes", "channel {id} no longer resolves, dropping");
+                    self.drop_channel(*id);
+                }
+                if !missing.is_empty() {
+                    self.emit_status(Some("a channel no longer resolves and was removed"));
+                    WorkState::apply_prune_ids(&self.work, &missing).await;
                 }
             }
             Err(error) => {
@@ -478,17 +463,7 @@ impl Session {
     }
 
     fn upsert(&mut self, user: User) {
-        self.channels.insert(
-            user.channel_id,
-            Tracked {
-                login: user.channel_name,
-                display_name: user.channel_display_name,
-                avatar: user.profile_image_url,
-                title: user.stream_title,
-                game: user.game,
-                live: user.live,
-            },
-        );
+        self.channels.insert(user.channel_id, user);
     }
 
     /// Registers a channel's two topics if not registered already. Entries
@@ -742,14 +717,14 @@ impl Session {
             .filter(|game| !game.is_empty())
             .map(String::from);
         let old_game = pubsub["old_game"].as_str().unwrap_or_default();
-        let Some(tracked) = self.channels.get_mut(&channel_id) else {
+        let Some(user) = self.channels.get_mut(&channel_id) else {
             return;
         };
-        let title_changed = tracked.title.as_deref() != Some(status.as_str());
-        let game_changed = game.as_deref() != tracked.game.as_ref().map(|game| game.name.as_str());
+        let title_changed = user.stream_title.as_deref() != Some(status.as_str());
+        let game_changed = game.as_deref() != user.game.as_ref().map(|game| game.name.as_str());
         // a local because nursery's suspicious_operation_groupings misfires
         // when the two fields appear in one && chain
-        let can_notify = self.preferences.notify_title_changes && !tracked.live;
+        let can_notify = self.preferences.notify_title_changes && !user.live;
         if can_notify && (title_changed || game_changed) {
             let mut lines = Vec::new();
             if title_changed {
@@ -767,18 +742,18 @@ impl Session {
             .collect::<Vec<_>>()
             .join(" & ");
             notifier::notify(
-                &format!("[{}] {what} changed", tracked.display_name),
+                &format!("[{}] {what} changed", user.channel_display_name),
                 &lines.join("\n"),
                 self.preferences.sound,
-                Some(tracked.avatar.as_str()).filter(|url| !url.is_empty()),
-                Some(&tracked.login),
+                Some(user.profile_image_url.as_str()).filter(|url| !url.is_empty()),
+                Some(&user.channel_name),
             )
             .await;
         }
         // mirrors the TS client's state updates for these events
-        tracked.title = Some(status).filter(|title| !title.is_empty());
-        let game_display_name = tracked.game.as_ref().map(|game| game.display_name.clone());
-        tracked.game = game.zip(pubsub["game_id"].as_u64()).map(|(name, id)| Game {
+        user.stream_title = Some(status).filter(|title| !title.is_empty());
+        let game_display_name = user.game.as_ref().map(|game| game.display_name.clone());
+        user.game = game.zip(pubsub["game_id"].as_u64()).map(|(name, id)| Game {
             id,
             name,
             display_name: game_display_name.unwrap_or_default(),
@@ -797,14 +772,14 @@ impl Session {
             Some("stream-up") => {
                 // Optimistic: flip live and notify from the cached baseline
                 // first, so neither waits for the gql round-trip below.
-                let cached = self.channels.get_mut(&channel_id).map(|tracked| {
-                    tracked.live = true;
+                let cached = self.channels.get_mut(&channel_id).map(|user| {
+                    user.live = true;
                     (
-                        tracked.login.clone(),
-                        tracked.display_name.clone(),
-                        tracked.game.clone(),
-                        tracked.title.clone(),
-                        tracked.avatar.clone(),
+                        user.channel_name.clone(),
+                        user.channel_display_name.clone(),
+                        user.game.clone(),
+                        user.stream_title.clone(),
+                        user.profile_image_url.clone(),
                     )
                 });
                 self.emit_status(None);
@@ -852,8 +827,8 @@ impl Session {
                 }
             }
             Some("stream-down") => {
-                if let Some(tracked) = self.channels.get_mut(&channel_id) {
-                    tracked.live = false;
+                if let Some(user) = self.channels.get_mut(&channel_id) {
+                    user.live = false;
                 }
             }
             _ => {}
@@ -902,20 +877,19 @@ impl Session {
         let mut channels: Vec<ChannelStatus> = self
             .channels
             .iter()
-            .map(|(id, tracked)| ChannelStatus {
+            .map(|(id, user)| ChannelStatus {
                 channel_id: *id,
-                login: tracked.login.clone(),
-                display_name: tracked.display_name.clone(),
+                login: user.channel_name.clone(),
+                display_name: user.channel_display_name.clone(),
                 title_status: self.status_for("broadcast-settings-update", *id),
                 live_status: self.status_for("video-playback-by-id", *id),
             })
             .collect();
         channels.sort_by(|left, right| left.login.cmp(&right.login));
-        let status = StatusEvent {
+        let status = StatusSnapshot {
             connected: self.socket.is_some() && self.welcomed,
             error: error.map(String::from),
             channels,
-            unresolved: self.unresolved.clone(),
         };
         self.work.borrow_mut().set_status(status);
     }

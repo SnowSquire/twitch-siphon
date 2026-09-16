@@ -7,7 +7,7 @@ use windows_sys::Win32::{Foundation::HWND, UI::WindowsAndMessaging as wam};
 
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::hermes::{StatusEvent, SubStatus};
+use crate::hermes::{StatusSnapshot, SubStatus};
 use crate::state::{FrameState, UiIntent};
 use crate::tray::{Tray, TrayAction};
 
@@ -141,39 +141,25 @@ impl SiphonApp {
                                 .iter()
                                 .find(|entry| entry.channel_id == channel.id)
                         });
-                        let not_found = status.is_some_and(|snapshot| {
-                            snapshot
-                                .unresolved
-                                .iter()
-                                .any(|login| login.eq_ignore_ascii_case(&channel.login))
-                        });
                         let name = resolved
                             .map(|entry| entry.display_name.clone())
                             .or_else(|| channel.display_name.clone())
                             .unwrap_or_else(|| channel.login.clone());
-                        if not_found {
-                            ui.colored_label(RED, name);
-                            badge(ui, "Not found", RED);
-                            badge(ui, "Not found", RED);
-                        } else {
-                            ui.label(name);
-                            sub_badge(
-                                ui,
-                                resolved.map_or(SubStatus::Pending, |entry| entry.live_status),
-                            );
-                            sub_badge(
-                                ui,
-                                resolved.map_or(SubStatus::Pending, |entry| entry.title_status),
-                            );
-                        }
+                        ui.label(name);
+                        sub_badge(
+                            ui,
+                            resolved.map_or(SubStatus::Pending, |entry| entry.live_status),
+                        );
+                        sub_badge(
+                            ui,
+                            resolved.map_or(SubStatus::Pending, |entry| entry.title_status),
+                        );
                         if ui
                             .button("×")
                             .on_hover_text(format!("Remove {}", channel.login))
                             .clicked()
                         {
-                            let _ = self
-                                .ui_tx
-                                .send(UiIntent::RemoveLogin(channel.login.clone()));
+                            let _ = self.ui_tx.send(UiIntent::RemoveChannel(channel.id));
                         }
                         ui.end_row();
                     }
@@ -254,7 +240,7 @@ impl eframe::App for SiphonApp {
     }
 }
 
-fn connection_text(status: Option<&StatusEvent>) -> (String, egui::Color32) {
+fn connection_text(status: Option<&StatusSnapshot>) -> (String, egui::Color32) {
     match status {
         Some(snapshot) if snapshot.connected => ("Connected".to_owned(), GREEN),
         Some(snapshot) => (

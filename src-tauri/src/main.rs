@@ -54,8 +54,8 @@ fn main() {
 
     // Two threads, three channels, one doorbell. The GUI thread renders and
     // sends intents; the work thread owns all state and pushes frames back.
-    // Dropping the JoinHandle detaches the work thread; process exit cleans
-    // it up.
+    // Thread creation lives here so `hermes` never spawns; dropping the
+    // JoinHandle detaches the work thread, process exit cleans it up.
     let (ui_tx, ui_rx) = crossbeam_channel::unbounded::<UiIntent>();
     let (frame_tx, frame_rx) = crossbeam_channel::unbounded::<FrameState>();
     let (tray_tx, tray_rx) = crossbeam_channel::unbounded::<TrayAction>();
@@ -65,14 +65,20 @@ fn main() {
         status: None,
         error: String::new(),
     };
-    let _work_thread = hermes::spawn(WorkContext {
-        config_path,
-        config,
-        ui_rx,
-        frame_tx,
-        tray_tx,
-        waker: waker.clone(),
-    });
+    let work_waker = waker.clone();
+    let _work_thread = std::thread::Builder::new()
+        .name("hermes".to_owned())
+        .spawn(move || {
+            hermes::run(WorkContext {
+                config_path,
+                config,
+                ui_rx,
+                frame_tx,
+                tray_tx,
+                waker: work_waker,
+            });
+        })
+        .expect("hermes thread");
 
     // Primary-instance listener, kept alive until the process exits. The
     // callback only wakes the event loop; the `check_show` poll in `logic()`

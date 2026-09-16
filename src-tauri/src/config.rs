@@ -29,6 +29,9 @@ pub struct Config {
 impl Config {
     pub const VERSION: u32 = 1;
 
+    /// Synchronous on purpose: the single call site is `main`, on the GUI
+    /// thread before any runtime exists, where blocking is harmless. The
+    /// runtime path ([`WorkState`](crate::state::WorkState)) only saves.
     pub fn load(path: &Path) -> Self {
         let config: Self = std::fs::read(path)
             .ok()
@@ -41,11 +44,14 @@ impl Config {
         }
     }
 
-    pub fn save(&self, path: &Path) -> Result<(), IoError> {
+    /// Async so the work-thread runtime (thread-per-core) never blocks on
+    /// disk: one chunked write straight from the serialized string, with no
+    /// intermediate buffer beyond it.
+    pub async fn save(&self, path: &Path) -> Result<(), IoError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            compio::fs::create_dir_all(parent).await?;
         }
-        let bytes = serde_json::to_vec_pretty(self).map_err(IoError::other)?;
-        std::fs::write(path, bytes)
+        let json = serde_json::to_string_pretty(self).map_err(IoError::other)?;
+        compio::fs::write(path, json).await.0
     }
 }

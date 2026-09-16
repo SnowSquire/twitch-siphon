@@ -1,10 +1,9 @@
-#[cfg(target_os = "windows")]
-use tauri_winrt_notification::{Duration, Sound, Toast};
 #[cfg(not(target_os = "windows"))]
 use notify_rust::{Notification, NotificationResponse, Timeout};
+#[cfg(target_os = "windows")]
+use tauri_winrt_notification::{Duration, Sound, Toast};
 
 use crate::gql;
-use crate::logging::log;
 
 /// aumid the toasts are shown under; registered per-user on startup so the
 /// notification banner shows us instead of the powershell fallback
@@ -19,11 +18,8 @@ const DISPLAY_NAME: &str = "Siphon";
 #[cfg(target_os = "windows")]
 pub fn register_aumid() {
     let icon_path = std::env::temp_dir().join("twitch-siphon-icon.png");
-    if let Err(error) = std::fs::write(&icon_path, include_bytes!("../icons/icon.png")) {
-        log(
-            "notifier",
-            format!("failed to write notification icon: {error}"),
-        );
+    if let Err(error) = std::fs::write(&icon_path, crate::tray::ICON_PNG) {
+        log::info!(target: "notifier", "failed to write notification icon: {error}");
         return;
     }
     let result = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
@@ -33,7 +29,7 @@ pub fn register_aumid() {
             key.set_value("IconUri", &icon_path.as_os_str())
         });
     if let Err(error) = result {
-        log("notifier", format!("failed to register aumid: {error}"));
+        log::info!(target: "notifier", "failed to register aumid: {error}");
     }
 }
 
@@ -88,14 +84,14 @@ fn show_toast(job: &ToastJob) {
         toast = toast.on_activated(move |_| {
             let url = format!("https://www.twitch.tv/{login}");
             if let Err(error) = open::that(&url) {
-                log("notifier", format!("failed to open {url}: {error}"));
+                log::info!(target: "notifier", "failed to open {url}: {error}");
             }
             Ok(())
         });
     }
     let result = toast.show();
     if let Err(error) = result {
-        log("notifier", format!("failed to show notification: {error}"));
+        log::info!(target: "notifier", "failed to show notification: {error}");
     }
 }
 
@@ -110,11 +106,7 @@ fn show_toast(job: &ToastJob) {
         .summary(&job.summary)
         .body(&job.body)
         .timeout(Timeout::Never)
-        .sound_name(if job.sound {
-            "Default"
-        } else {
-            "Silent"
-        })
+        .sound_name(if job.sound { "Default" } else { "Silent" })
         .action("open", "Watch");
     if let Some(image) = &job.image {
         builder.image_path(image);
@@ -122,7 +114,7 @@ fn show_toast(job: &ToastJob) {
     let handle = match builder.show() {
         Ok(handle) => handle,
         Err(error) => {
-            log("notifier", format!("failed to show notification: {error}"));
+            log::info!(target: "notifier", "failed to show notification: {error}");
             return;
         }
     };
@@ -136,26 +128,27 @@ fn show_toast(job: &ToastJob) {
             NotificationResponse::Default | NotificationResponse::Action(_)
         ) {
             if let Err(error) = open::that(&url) {
-                log("notifier", format!("failed to open {url}: {error}"));
+                log::info!(target: "notifier", "failed to open {url}: {error}");
             }
         }
     }) {
-        log("notifier", format!("notification response failed: {error}"));
+        log::info!(target: "notifier", "notification response failed: {error}");
     }
 }
 
 /// downloads the avatar into a per-url temp cache file and returns the local
 /// path; the cdn url embeds the avatar hash, so a changed picture lands in a
-/// new file and stale ones are simply abandoned
+/// new file and stale ones are simply abandoned. Async fs throughout: this
+/// runs on the thread-per-core runtime, where synchronous file IO would block.
 async fn resolve_image(image: Option<&str>) -> Option<String> {
     let url = image?;
     let file_name = url.rsplit('/').next().filter(|name| !name.is_empty())?;
     let dir = std::env::temp_dir().join("twitch-siphon-avatars");
-    std::fs::create_dir_all(&dir).ok()?;
+    compio::fs::create_dir_all(&dir).await.ok()?;
     let path = dir.join(file_name);
-    if !path.exists() {
+    if compio::fs::metadata(&path).await.is_err() {
         if let Err(error) = gql::fetch_file(url, &path).await {
-            log("notifier", format!("failed to download avatar: {error}"));
+            log::info!(target: "notifier", "failed to download avatar: {error}");
             return None;
         }
     }
@@ -177,10 +170,7 @@ pub async fn notify(
     image: Option<&str>,
     login: Option<&str>,
 ) {
-    log(
-        "notifier",
-        format!("showing notification: {summary} | {body}"),
-    );
+    log::info!(target: "notifier", "showing notification: {summary} | {body}");
     // One worker owns all toasts: showing blocks, so a thread per toast
     // would pile up pool threads under bursts. Showing and waiting also must
     // happen on the same thread — some backends' handles are `!Send`.
@@ -193,6 +183,6 @@ pub async fn notify(
         login: login.map(str::to_owned),
     };
     if toast_sender().send(job).is_err() {
-        log("notifier", "notification worker gone");
+        log::info!(target: "notifier", "notification worker gone");
     }
 }
