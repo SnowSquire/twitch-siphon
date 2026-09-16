@@ -14,12 +14,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: pnpm/setup@v2
-        with:
-          version: 12
-          runtime: "node@lts"
-          cache: true
-
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
@@ -28,20 +22,13 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - uses: tauri-apps/tauri-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: v__VERSION__
-          releaseName: "Siphon v__VERSION__"
-          releaseBody: "See the assets to download and install."
-          releaseDraft: true
-          prerelease: false
-          args: --bundles nsis
+      - name: build portable binary
+        run: cargo build --release --locked
+        working-directory: src-tauri
 
       - name: prepare portable binary
         run: |
-          $version = (Get-Content package.json | ConvertFrom-Json).version
+          $version = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "([^"]+)"').Matches.Groups[1].Value
           Copy-Item "src-tauri/target/release/siphon.exe" "Siphon_${version}_x64-portable.exe"
 
       - name: upload portable binary
@@ -49,3 +36,4 @@ jobs:
         with:
           tag_name: ${{ github.ref_name }}
           files: Siphon_*-portable.exe
+          draft: true

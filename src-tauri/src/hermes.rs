@@ -1,17 +1,19 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
-use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, Manager, Runtime};
-use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
+use compio::net::TcpStream;
+use compio::ws::{WebSocketStream, connect_async};
+use compio::ws::tungstenite::Message;
+use futures_channel::mpsc;
+use futures_util::StreamExt;
+use serde_json::{Value, json};
 
 use crate::gql::{self, Game, User};
-use crate::logging::log;
 use crate::notifier;
-use crate::AppState;
+use crate::state::{UiIntent, WorkContext, WorkState};
+use crate::tray;
 
 const HERMES_URL: &str = "wss://hermes.twitch.tv/v1?clientId=kimne78kx3ncx6brgo4mv6wki5h1ko";
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -43,16 +45,14 @@ enum SubState {
     Failed,
 }
 
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy)]
 pub enum SubStatus {
     Pending,
     Connected,
     Failed,
 }
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone)]
 pub struct ChannelStatus {
     pub channel_id: u64,
     pub login: String,
@@ -62,10 +62,9 @@ pub struct ChannelStatus {
 }
 
 /// Snapshot of everything the ui needs to render the channel list and the
-/// connection state; pushed to the frontend on every state change via the
-/// `hermes-status` event and also served through the `get_status` command.
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// connection state; the work thread wraps it in a [`FrameState`](crate::state::FrameState)
+/// and pushes it to the GUI on every change.
+#[derive(Clone)]
 pub struct StatusEvent {
     pub connected: bool,
     pub error: Option<String>,
@@ -80,12 +79,7 @@ struct Tracked {
     login: String,
     display_name: String,
     avatar: String,
-    // stored for future use (history/dedup), not read yet
-    #[allow(dead_code)]
-    stream_id: u64,
     title: Option<String>,
-    #[allow(dead_code)]
-    stream_start: Option<i64>,
     game: Option<Game>,
     live: bool,
 }
@@ -99,9 +93,7 @@ impl Tracked {
                 .clone()
                 .unwrap_or_else(|| entry.login.clone()),
             avatar: String::new(),
-            stream_id: 0,
             title: None,
-            stream_start: None,
             game: None,
             live: false,
         }
@@ -113,13 +105,74 @@ struct Sub {
     state: SubState,
 }
 
-type WsStream = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type WsStream = WebSocketStream<TcpStream>;
 
-pub fn spawn<R: Runtime>(app: AppHandle<R>, command_rx: mpsc::UnboundedReceiver<Command>) {
-    tauri::async_runtime::spawn(async move {
-        let mut session = Session::new(app, command_rx);
-        session.main_loop().await;
-    });
+/// How often the poll task drains the sync inboxes (ui intents, tray
+/// events). Bounds click-to-effect latency; the runtime otherwise sleeps.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Runs the whole work side on its own OS thread owning a compio runtime:
+/// the hermes session task plus a poll task that bridges the sync inboxes
+/// (GUI intents, tray events) into it. Everything on this thread is
+/// single-threaded (`Rc`, no `Mutex`); crossbeam channels are the only
+/// bridge to the GUI thread.
+pub fn spawn(ctx: WorkContext) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("hermes".to_owned())
+        .spawn(move || {
+            compio::runtime::Runtime::new()
+                .expect("compio runtime")
+                .block_on(async move {
+                    let (session_tx, command_rx) = mpsc::unbounded();
+                    let work = Rc::new(RefCell::new(WorkState::new(ctx, session_tx)));
+                    work.borrow().seed();
+                    // Detached: both tasks run until the runtime drops with
+                    // the process; there is nothing to join or cancel.
+                    let _poll: compio::runtime::JoinHandle<()> =
+                        compio::runtime::spawn(poll_loop(Rc::clone(&work)));
+                    let mut session = Session::new(work, command_rx);
+                    session.main_loop().await;
+                });
+        })
+        .expect("hermes thread")
+}
+
+/// Bridges the sync inboxes into the runtime: drains UI intents and tray
+/// events with non-blocking `try_recv` on a short interval, so neither the
+/// GUI thread nor this runtime ever blocks. Intent handling is synchronous;
+/// resolves run as spawned tasks on this same runtime.
+async fn poll_loop(work: Rc<RefCell<WorkState>>) {
+    let mut tick = compio::time::interval(POLL_INTERVAL);
+    loop {
+        tick.tick().await;
+        for intent in work.borrow().drain_intents() {
+            match intent {
+                UiIntent::AddLogin(login) => {
+                    if let Some(login) = work.borrow_mut().begin_add_login(&login) {
+                        let resolved = Rc::clone(&work);
+                        let _resolve: compio::runtime::JoinHandle<()> =
+                            compio::runtime::spawn(async move {
+                                let users =
+                                    gql::fetch_users(&[], std::slice::from_ref(&login)).await;
+                                resolved.borrow_mut().finish_add_login(login, users);
+                            });
+                    }
+                }
+                UiIntent::RemoveLogin(login) => {
+                    work.borrow_mut().apply_remove_login(&login);
+                }
+                UiIntent::SetNotifyTitleChanges(value) => {
+                    work.borrow_mut().apply_notify_title_changes(value);
+                }
+                UiIntent::SetSound(value) => {
+                    work.borrow_mut().apply_sound(value);
+                }
+            }
+        }
+        for action in tray::drain_pending() {
+            work.borrow().forward_tray(action);
+        }
+    }
 }
 
 /// Notification preferences the ui can change at runtime.
@@ -128,8 +181,8 @@ struct Preferences {
     sound: bool,
 }
 
-struct Session<R: Runtime> {
-    app: AppHandle<R>,
+struct Session {
+    work: Rc<RefCell<WorkState>>,
     command_rx: mpsc::UnboundedReceiver<Command>,
     channels: HashMap<u64, Tracked>,
     unresolved: Vec<String>,
@@ -145,10 +198,10 @@ struct Session<R: Runtime> {
     rng_state: u64,
 }
 
-impl<R: Runtime> Session<R> {
-    fn new(app: AppHandle<R>, command_rx: mpsc::UnboundedReceiver<Command>) -> Self {
+impl Session {
+    fn new(work: Rc<RefCell<WorkState>>, command_rx: mpsc::UnboundedReceiver<Command>) -> Self {
         Self {
-            app,
+            work,
             command_rx,
             channels: HashMap::new(),
             unresolved: Vec::new(),
@@ -170,37 +223,42 @@ impl<R: Runtime> Session<R> {
     }
 
     async fn main_loop(&mut self) {
-        log("hermes", "worker started");
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        use futures_util::FutureExt as _;
+        log::info!(target: "hermes", "worker started");
+        let mut tick = compio::time::interval(Duration::from_secs(1));
         loop {
             if self.socket.is_none() && self.has_work() && Instant::now() >= self.reconnect_at {
                 self.connect().await;
             }
             // When disconnected there is no socket to poll, so park that
             // branch on a never-resolving future until the next connect.
-            let socket_msg = async {
+            let command_fut = self.command_rx.next().fuse();
+            let socket_fut = async {
                 match self.socket.as_mut() {
                     Some(socket) => socket.next().await,
                     None => std::future::pending().await,
                 }
-            };
-            tokio::select! {
-                command = self.command_rx.recv() => {
+            }
+            .fuse();
+            let tick_fut = tick.tick().fuse();
+            futures_util::pin_mut!(command_fut, socket_fut, tick_fut);
+            futures_util::select! {
+                command = command_fut => {
                     let Some(command) = command else { return };
                     self.on_command(command).await;
                 }
-                message = socket_msg => {
+                message = socket_fut => {
                     // Convert to an owned event first so the tungstenite
                     // `Message` (which owns refcounted bytes) is dropped
                     // before any await below runs.
                     enum SocketEvent {
-                        Text(tokio_tungstenite::tungstenite::Utf8Bytes),
+                        Text(compio::ws::tungstenite::Utf8Bytes),
                         Closed,
                         Ignored,
                     }
                     let event = match message {
                         Some(Ok(Message::Close(_))) => {
-                            log("hermes", "server sent close frame");
+                            log::info!(target: "hermes", "server sent close frame");
                             SocketEvent::Closed
                         }
                         // Text and binary frames carry the same json payloads.
@@ -208,11 +266,11 @@ impl<R: Runtime> Session<R> {
                             .into_text()
                             .map_or_else(|_| SocketEvent::Ignored, SocketEvent::Text),
                         Some(Err(error)) => {
-                            log("hermes", format!("read error: {error}"));
+                            log::info!(target: "hermes", "read error: {error}");
                             SocketEvent::Closed
                         }
                         None => {
-                            log("hermes", "connection closed");
+                            log::info!(target: "hermes", "connection closed");
                             SocketEvent::Closed
                         }
                     };
@@ -226,7 +284,7 @@ impl<R: Runtime> Session<R> {
                         SocketEvent::Ignored => {}
                     }
                 }
-                _ = tick.tick() => {
+                _ = tick_fut => {
                     self.on_tick().await;
                 }
             }
@@ -246,11 +304,11 @@ impl<R: Runtime> Session<R> {
             Command::AddChannel(entry) => self.add_channel(entry).await,
             Command::RemoveChannel(login) => self.remove_channel(&login).await,
             Command::SetNotifyTitleChanges(value) => {
-                log("hermes", format!("notify_title_changes={value}"));
+                log::info!(target: "hermes", "notify_title_changes={value}");
                 self.preferences.notify_title_changes = value;
             }
             Command::SetSound(value) => {
-                log("hermes", format!("sound={value}"));
+                log::info!(target: "hermes", "sound={value}");
                 self.preferences.sound = value;
             }
         }
@@ -268,9 +326,12 @@ impl<R: Runtime> Session<R> {
         {
             return;
         }
-        log("hermes", format!("channel {} added", entry.login));
+        log::info!(target: "hermes", "channel {} added", entry.login);
         // One targeted fetch seeds the notify baseline (title/game/live)
-        // and resolves a bare login to its id in the same response.
+        // and resolves a bare login to its id in the same response. The
+        // bridge may have fetched already for its persist decision; this
+        // second fetch is deliberate (baseline seeding is this task's job)
+        // and costs one request per explicit user add.
         let ids = entry.id.into_iter().collect::<Vec<_>>();
         let logins = entry
             .id
@@ -294,19 +355,17 @@ impl<R: Runtime> Session<R> {
                         self.after_resolve(id).await;
                     }
                     (None, None) => {
-                        log(
-                            "hermes",
-                            format!(
-                                "gql returned no channel named {}, is it a typo?",
-                                entry.login
-                            ),
+                        log::info!(
+                            target: "hermes",
+                            "gql returned no channel named {}, is it a typo?",
+                            entry.login
                         );
                         self.unresolved.push(entry.login);
                     }
                 }
             }
             Err(error) => {
-                log("hermes", format!("failed to fetch channel: {error}"));
+                log::info!(target: "hermes", "failed to fetch channel: {error}");
                 match entry.id {
                     Some(id) => {
                         self.channels.insert(id, Tracked::placeholder(&entry));
@@ -339,11 +398,11 @@ impl<R: Runtime> Session<R> {
             .map(|(id, _)| *id)
         {
             if let Some(tracked) = self.channels.remove(&id) {
-                log("hermes", format!("channel {} removed", tracked.login));
+                log::info!(target: "hermes", "channel {} removed", tracked.login);
                 for prefix in TOPIC_PREFIXES {
                     let topic = format!("{prefix}.{id}");
                     if let Some(sub) = self.subs.remove(&topic) {
-                        log("hermes", format!("unsubscribing from {topic}"));
+                        log::info!(target: "hermes", "unsubscribing from {topic}");
                         let message_id = self.nano_id();
                         self.send_message(&json!({
                             "type": "unsubscribe",
@@ -367,24 +426,24 @@ impl<R: Runtime> Session<R> {
         self.sync(&ids, &logins).await;
         if self.channels.is_empty() {
             // Connecting with no subscribable channel would just time out.
-            log(
-                "hermes",
-                "no channels resolved, retrying (typo in a login?)",
+            log::info!(
+                target: "hermes",
+                "no channels resolved, retrying (typo in a login?)"
             );
             self.emit_status(Some("no channels found for the configured logins"));
             self.schedule_reconnect();
             return;
         }
-        log("hermes", format!("connecting to {HERMES_URL}"));
+        log::info!(target: "hermes", "connecting to {HERMES_URL}");
         match connect_async(HERMES_URL).await {
             Ok((socket, _)) => {
-                log("hermes", "connected, waiting for welcome");
+                log::info!(target: "hermes", "connected, waiting for welcome");
                 self.socket = Some(socket);
                 self.welcomed = false;
                 self.last_message = Instant::now();
             }
             Err(error) => {
-                log("hermes", format!("connect failed: {error}"));
+                log::info!(target: "hermes", "connect failed: {error}");
                 self.on_disconnect().await;
             }
         }
@@ -408,7 +467,7 @@ impl<R: Runtime> Session<R> {
                 }
             }
             Err(error) => {
-                log("hermes", format!("channel refresh failed: {error}"));
+                log::info!(target: "hermes", "channel refresh failed: {error}");
                 // Still subscribe known ids: live notifications work from
                 // pubsub alone, only the title baseline is stale.
                 for id in ids {
@@ -425,9 +484,7 @@ impl<R: Runtime> Session<R> {
                 login: user.channel_name,
                 display_name: user.channel_display_name,
                 avatar: user.profile_image_url,
-                stream_id: user.stream_id,
                 title: user.stream_title,
-                stream_start: user.stream_start,
                 game: user.game,
                 live: user.live,
             },
@@ -468,7 +525,7 @@ impl<R: Runtime> Session<R> {
         let delay = Duration::from_millis(500)
             .saturating_mul(1 << (self.reconnect_attempt.min(10) - 1))
             .min(MAX_RECONNECT_DELAY);
-        log("hermes", format!("disconnected, reconnecting in {delay:?}"));
+        log::info!(target: "hermes", "disconnected, reconnecting in {delay:?}");
         self.reconnect_at = Instant::now() + delay;
     }
 
@@ -488,18 +545,16 @@ impl<R: Runtime> Session<R> {
             // The server never sent a welcome; treat the connection as dead.
             // Any message at all counts as signs of life and pushes this out.
             if self.last_message.elapsed() > WELCOME_TIMEOUT {
-                log("hermes", "no welcome within 10s, dropping connection");
+                log::info!(target: "hermes", "no welcome within 10s, dropping connection");
                 self.on_disconnect().await;
             }
         } else if self.last_message.elapsed()
             > Duration::from_secs(self.keepalive_secs * KEEPALIVE_MISSED_LIMIT)
         {
-            log(
-                "hermes",
-                format!(
-                    "no keepalive for {}s, dropping connection",
-                    self.keepalive_secs * KEEPALIVE_MISSED_LIMIT
-                ),
+            log::info!(
+                target: "hermes",
+                "no keepalive for {}s, dropping connection",
+                self.keepalive_secs * KEEPALIVE_MISSED_LIMIT
             );
             self.on_disconnect().await;
         }
@@ -513,7 +568,7 @@ impl<R: Runtime> Session<R> {
             return;
         }
         let Ok(message) = serde_json::from_str::<Value>(text) else {
-            log("hermes", format!("unparseable message: {text}"));
+            log::info!(target: "hermes", "unparseable message: {text}");
             return;
         };
         match message["type"].as_str() {
@@ -528,10 +583,7 @@ impl<R: Runtime> Session<R> {
                 self.welcomed = true;
                 self.reconnect_attempt = 0;
                 self.keepalive_secs = message["welcome"]["keepaliveSec"].as_u64().unwrap_or(15);
-                log(
-                    "hermes",
-                    format!("welcome: keepalive={}s", self.keepalive_secs),
-                );
+                log::info!(target: "hermes", "welcome: keepalive={}s", self.keepalive_secs);
                 notifier::notify(
                     summary,
                     &format!("watching {} channel(s)", self.channels.len()),
@@ -566,23 +618,23 @@ impl<R: Runtime> Session<R> {
                     }
                     None => return,
                 };
-                log(
-                    "hermes",
-                    format!(
-                        "subscription to {topic} {}",
-                        if ok { "accepted" } else { "rejected" }
-                    ),
+                log::info!(
+                    target: "hermes",
+                    "subscription to {topic} {}",
+                    if ok { "accepted" } else { "rejected" }
                 );
                 self.emit_status(None);
             }
-            Some("unsubscribeResponse") => log("hermes", format!("unsubscribe response: {text}")),
+            Some("unsubscribeResponse") => {
+                log::info!(target: "hermes", "unsubscribe response: {text}");
+            }
             Some("notification") => self.handle_notification(&message).await,
-            _ => log("hermes", format!("unknown message: {text}")),
+            _ => log::info!(target: "hermes", "unknown message: {text}"),
         }
     }
 
     async fn resubscribe_all(&mut self) {
-        log("hermes", format!("replaying {} topic(s)", self.subs.len()));
+        log::info!(target: "hermes", "replaying {} topic(s)", self.subs.len());
         let pending: Vec<(String, String)> = self
             .subs
             .iter_mut()
@@ -605,9 +657,10 @@ impl<R: Runtime> Session<R> {
             .filter_map(|topic| self.subs.get(&topic).map(|sub| (sub.id.clone(), topic)))
             .collect();
         if !pending.is_empty() {
-            log(
-                "hermes",
-                format!("subscribing {} topic(s) for {id}", pending.len()),
+            log::info!(
+                target: "hermes",
+                "subscribing {} topic(s) for {id}",
+                pending.len()
             );
         }
         for (sub_id, topic) in pending {
@@ -616,7 +669,7 @@ impl<R: Runtime> Session<R> {
     }
 
     async fn send_subscribe(&mut self, subscription_id: &str, topic: &str) {
-        log("hermes", format!("subscribing to {topic}"));
+        log::info!(target: "hermes", "subscribing to {topic}");
         let id = self.nano_id();
         self.send_message(&json!({
             "type": "subscribe",
@@ -636,7 +689,7 @@ impl<R: Runtime> Session<R> {
             return;
         };
         if let Err(error) = socket.send(Message::text(message.to_string())).await {
-            log("hermes", format!("send failed: {error}"));
+            log::info!(target: "hermes", "send failed: {error}");
             self.on_disconnect().await;
         }
     }
@@ -667,12 +720,10 @@ impl<R: Runtime> Session<R> {
         else {
             return;
         };
-        log(
-            "hermes",
-            format!(
-                "notification on {topic}: {}",
-                serde_json::to_string(&pubsub).unwrap_or_default()
-            ),
+        log::info!(
+            target: "hermes",
+            "notification on {topic}: {}",
+            serde_json::to_string(&pubsub).unwrap_or_default()
         );
         match kind {
             "broadcast-settings-update" => {
@@ -795,7 +846,9 @@ impl<R: Runtime> Session<R> {
                         self.upsert(user);
                         self.emit_status(None);
                     }
-                    Err(error) => log("hermes", format!("stream-up refresh failed: {error}")),
+                    Err(error) => {
+                        log::info!(target: "hermes", "stream-up refresh failed: {error}");
+                    }
                 }
             }
             Some("stream-down") => {
@@ -864,15 +917,7 @@ impl<R: Runtime> Session<R> {
             channels,
             unresolved: self.unresolved.clone(),
         };
-        if let Some(state) = self.app.try_state::<AppState>() {
-            *state.status.lock().expect("status lock poisoned") = Some(status.clone());
-        }
-        if let Err(send_error) = self.app.emit("hermes-status", &status) {
-            log(
-                "hermes",
-                format!("failed to emit status event: {send_error}"),
-            );
-        }
+        self.work.borrow_mut().set_status(status);
     }
 
     fn nano_id(&mut self) -> String {

@@ -1,45 +1,20 @@
 use std::error::Error as StdError;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
-use hyper::header::CONTENT_TYPE;
-use hyper::{Method, Request};
-use hyper_rustls::HttpsConnectorBuilder;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
 use serde_json::{json, Value};
 
-use crate::logging::{log, parse_iso_ms};
+use crate::logging::parse_iso_ms;
 
 const GQL_URL: &str = "https://gql.twitch.tv/gql";
 const CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 const GQL_TIMEOUT: Duration = Duration::from_secs(15);
 
-type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
-
-// Built once and shared across all gql requests so connections are pooled.
-// hyper's legacy Client is internally immutable and its connection pool is
-// already Send + Sync, so a plain Arc (no Mutex) is enough.
-static GQL_CLIENT: OnceLock<Arc<HttpsClient>> = OnceLock::new();
-
-fn client() -> Arc<HttpsClient> {
-    GQL_CLIENT
-        .get_or_init(|| {
-            Arc::new(
-                Client::builder(TokioExecutor::new()).build(
-                    HttpsConnectorBuilder::new()
-                        .with_webpki_roots()
-                        .https_or_http()
-                        .enable_http1()
-                        .build(),
-                ),
-            )
-        })
-        .clone()
+// cyper's `Client` is thread-local (`!Send + !Sync`, backed by `Rc`), so it
+// cannot live in a shared static. Each compio runtime thread builds its own
+// (fetches here are infrequent: connect/add/stream-up, plus avatar downloads).
+fn client() -> Result<cyper::Client, Error> {
+    Ok(cyper::Client::new()?)
 }
 
 // The full user record: ids and start times are stored for future use
@@ -92,30 +67,31 @@ pub async fn fetch_users(ids: &[u64], logins: &[String]) -> Result<Vec<User>, Er
             "operationName": "UsersByLogins",
         }));
     }
-    log("gql", format!("request: ids={ids:?} logins={logins:?}"));
+    log::info!(target: "gql", "request: ids={ids:?} logins={logins:?}");
 
     let payload = serde_json::to_vec(&Value::Array(operations))?;
-    let client = client();
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri(GQL_URL)
-        .header(CONTENT_TYPE, "application/json")
-        .header("Client-ID", CLIENT_ID)
-        .body(Full::new(Bytes::from(payload)))?;
-    let response = tokio::time::timeout(GQL_TIMEOUT, client.request(request))
-        .await
-        .map_err(|_| "gql request timed out")??;
+    let client = client()?;
+    let response = compio::time::timeout(
+        GQL_TIMEOUT,
+        client
+            .post(GQL_URL)?
+            .header("Content-Type", "application/json")?
+            .header("Client-ID", CLIENT_ID)?
+            .body(payload)
+            .send(),
+    )
+    .await
+    .map_err(|_| "gql request timed out")??;
     if !response.status().is_success() {
         return Err(format!("gql returned status {}", response.status()).into());
     }
-    let body = tokio::time::timeout(GQL_TIMEOUT, response.into_body().collect())
+    let body = compio::time::timeout(GQL_TIMEOUT, response.bytes())
         .await
-        .map_err(|_| "gql body read timed out")??
-        .to_bytes();
+        .map_err(|_| "gql body read timed out")??;
     let response: Value = serde_json::from_slice(&body)?;
 
     let Some(responses) = response.as_array() else {
-        log("gql", "unexpected response shape, expected an array");
+        log::info!(target: "gql", "unexpected response shape, expected an array");
         return Ok(Vec::new());
     };
     let users = responses
@@ -151,41 +127,34 @@ pub async fn fetch_users(ids: &[u64], logins: &[String]) -> Result<Vec<User>, Er
             })
         })
         .collect::<Vec<_>>();
-    log(
-        "gql",
-        format!(
-            "parsed {} user(s): {}",
-            users.len(),
-            users
-                .iter()
-                .map(|user| format!(
-                    "{}({}){}",
-                    user.channel_name,
-                    user.channel_id,
-                    if user.live { " live" } else { "" }
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+    log::info!(
+        target: "gql",
+        "parsed {} user(s): {}",
+        users.len(),
+        users
+            .iter()
+            .map(|user| format!(
+                "{}({}){}",
+                user.channel_name,
+                user.channel_id,
+                if user.live { " live" } else { "" }
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     Ok(users)
 }
 
 /// downloads an arbitrary cdn file (e.g. a profile picture) to `path`
 pub async fn fetch_file(url: &str, path: &Path) -> Result<(), Error> {
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri(url)
-        .body(Full::new(Bytes::new()))?;
-    let response = tokio::time::timeout(GQL_TIMEOUT, client().request(request))
+    let response = compio::time::timeout(GQL_TIMEOUT, client()?.get(url)?.send())
         .await
         .map_err(|_| "image request timed out")??;
     if !response.status().is_success() {
         return Err(format!("image returned status {}", response.status()).into());
     }
-    let bytes = tokio::time::timeout(GQL_TIMEOUT, response.into_body().collect())
+    let bytes = compio::time::timeout(GQL_TIMEOUT, response.bytes())
         .await
-        .map_err(|_| "image body read timed out")??
-        .to_bytes();
+        .map_err(|_| "image body read timed out")??;
     Ok(std::fs::write(path, &bytes)?)
 }

@@ -87,7 +87,7 @@ fn show_toast(job: &ToastJob) {
     if let Some(login) = job.login.clone() {
         toast = toast.on_activated(move |_| {
             let url = format!("https://www.twitch.tv/{login}");
-            if let Err(error) = tauri_plugin_opener::open_url(&url, None::<&str>) {
+            if let Err(error) = open::that(&url) {
                 log("notifier", format!("failed to open {url}: {error}"));
             }
             Ok(())
@@ -135,7 +135,7 @@ fn show_toast(job: &ToastJob) {
             response,
             NotificationResponse::Default | NotificationResponse::Action(_)
         ) {
-            if let Err(error) = tauri_plugin_opener::open_url(&url, None::<&str>) {
+            if let Err(error) = open::that(&url) {
                 log("notifier", format!("failed to open {url}: {error}"));
             }
         }

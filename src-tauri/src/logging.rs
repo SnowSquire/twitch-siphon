@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Backend log helper. Routes through the `log` crate so records fan out
-/// to the tauri-plugin-log targets (stdout + webview console).
+/// to the configured sinks (stderr via `env_logger`).
 /// `module` becomes the log target, e.g. `log::info!(target: "hermes", …)`.
 pub fn log(module: &str, message: impl std::fmt::Display) {
     log::info!(target: module, "{message}");
