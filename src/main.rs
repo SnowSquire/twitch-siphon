@@ -2,27 +2,33 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod balesh;
 mod config;
+mod event_loop;
 mod gql;
 mod hermes;
 mod logging;
 mod notifier;
 mod state;
 mod tray;
-
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::config::Config;
-use crate::state::{FrameState, GuiWaker, UiIntent, WorkContext};
+use crate::event_loop::EventLoop;
+use crate::hermes::Session;
+use crate::state::{FrameState, GuiWaker, UiIntent, WorkContext, WorkState};
 use crate::tray::TrayAction;
 
 /// Single-instance key and config directory name.
 const APP_ID: &str = "com.iken.siphon";
 
 fn main() {
-    env_logger::init();
+    let log_file = crate::logging::init(APP_ID);
+    log::info!(target: "app", "logging to {}", log_file.display());
 
     // A second launch wakes the first instance and exits immediately.
     if app_single_instance::notify_if_running(APP_ID) {
@@ -51,37 +57,50 @@ fn main() {
         config.sound,
     );
 
-    // Two threads, three channels, one doorbell. The GUI thread renders and
-    // sends intents; the work thread owns all state and pushes frames back.
-    // Thread creation lives here so `hermes` never spawns; dropping the
-    // JoinHandle detaches the work thread, process exit cleans it up.
-    let (ui_tx, ui_rx) = crossbeam_channel::unbounded::<UiIntent>();
-    let (frame_tx, frame_rx) = crossbeam_channel::unbounded::<FrameState>();
-    let (tray_tx, tray_rx) = crossbeam_channel::unbounded::<TrayAction>();
+    let (ui_tx, ui_rx) = kanal::unbounded::<UiIntent>();
+    let (frame_tx, frame_rx) = kanal::unbounded::<FrameState>();
+    let (tray_tx, tray_rx) = kanal::unbounded::<TrayAction>();
+    let tray_events = tray::spawn_proxy();
     let waker = GuiWaker::new();
     let initial = FrameState {
         config: config.clone(),
         status: None,
         error: String::new(),
     };
+
+    //worker thread, runs hermes and event loop
     let work_waker = waker.clone();
     let _work_thread = std::thread::Builder::new()
-        .name("hermes".to_owned())
+        .name("worker thread".to_owned())
         .spawn(move || {
-            hermes::run(WorkContext {
-                config_path,
-                config,
-                ui_rx,
-                frame_tx,
-                tray_tx,
-                waker: work_waker,
-            });
+            {
+                compio::runtime::Runtime::new()
+                    .expect("compio runtime")
+                    .block_on(async move {
+                        let (session_tx, command_rx) = kanal::unbounded();
+                        let work = Rc::new(RefCell::new(WorkState::new(
+                            WorkContext {
+                                config_path,
+                                config,
+                                ui_rx,
+                                frame_tx,
+                                tray_tx,
+                                tray_events,
+                                waker: work_waker,
+                            },
+                            session_tx,
+                        )));
+                        work.borrow().push_frame();
+                        let mut hermes = Session::new(Rc::clone(&work), command_rx.to_async());
+                        let mut events = EventLoop::new(work);
+
+                        futures_util::future::join(events.run(), hermes.run()).await;
+                    });
+            };
         })
         .expect("hermes thread");
 
-    // Primary-instance listener, kept alive until the process exits. The
-    // callback only wakes the event loop; the `check_show` poll in `logic()`
-    // performs the actual show (the context may not exist yet here).
+    // Spawns a thread
     let wake = waker.clone();
     let single = app_single_instance::start_primary(APP_ID, move || {
         log::info!(target: "single", "wake signal received, waking event loop");
@@ -91,7 +110,8 @@ fn main() {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Siphon")
         .with_app_id(APP_ID)
-        .with_inner_size([420.0, 520.0]);
+        .with_inner_size([420.0, 520.0])
+        .with_min_inner_size([420.0, 520.0]);
 
     match tray::load_icon_rgba() {
         Ok((rgba, width, height)) => {

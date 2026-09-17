@@ -4,15 +4,15 @@
 //! [`FrameState`] and sends [`UiIntent`]s. The work thread owns everything
 //! else (config, persistence, the hermes session) inside [`WorkState`], which
 //! lives on that single thread — no `Arc`, no `Mutex` for app state. The only
-//! cross-thread primitives are the [`crossbeam_channel`] queues below plus
+//! cross-thread primitives are the [`kanal`] queues below plus
 //! [`GuiWaker`], which is a doorbell, not state.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
-use crossbeam_channel::{Receiver, Sender};
+use kanal::{Receiver, Sender};
 
 use crate::config::{Channel, Config};
 use crate::gql;
@@ -28,6 +28,7 @@ pub enum UiIntent {
     RemoveChannel(u64),
     SetNotifyTitleChanges(bool),
     SetSound(bool),
+    ClearError,
 }
 
 /// Everything the GUI needs for one frame. Pushed work→GUI on every change;
@@ -49,7 +50,6 @@ pub struct GuiWaker {
 }
 
 impl GuiWaker {
-    #[allow(clippy::missing_const_for_fn)]
     pub fn new() -> Self {
         Self {
             ctx: Arc::new(OnceLock::new()),
@@ -75,6 +75,7 @@ pub struct WorkContext {
     pub ui_rx: Receiver<UiIntent>,
     pub frame_tx: Sender<FrameState>,
     pub tray_tx: Sender<TrayAction>,
+    pub tray_events: Receiver<TrayAction>,
     pub waker: GuiWaker,
 }
 
@@ -87,11 +88,13 @@ pub struct WorkState {
     config: Rc<Config>,
     error: String,
     status: Option<hermes::StatusSnapshot>,
-    session_tx: futures_channel::mpsc::UnboundedSender<hermes::Command>,
-    ui_rx: Receiver<UiIntent>,
+    session_tx: Sender<hermes::Command>,
+    pub(crate) ui_rx: kanal::AsyncReceiver<UiIntent>,
     frame_tx: Sender<FrameState>,
     tray_tx: Sender<TrayAction>,
+    pub(crate) tray_events: kanal::AsyncReceiver<TrayAction>,
     waker: GuiWaker,
+    pub(crate) pending_adds: Arc<RwLock<Vec<String>>>,
 }
 
 struct PendingSave {
@@ -101,33 +104,29 @@ struct PendingSave {
 }
 
 impl WorkState {
-    pub fn new(
-        ctx: WorkContext,
-        session_tx: futures_channel::mpsc::UnboundedSender<hermes::Command>,
-    ) -> Self {
+    pub fn new(ctx: WorkContext, session_tx: Sender<hermes::Command>) -> Self {
         Self {
             config_path: Rc::new(ctx.config_path),
             config: Rc::new(ctx.config),
             error: String::new(),
             status: None,
             session_tx,
-            ui_rx: ctx.ui_rx,
+            ui_rx: ctx.ui_rx.to_async(),
             frame_tx: ctx.frame_tx,
             tray_tx: ctx.tray_tx,
+            tray_events: ctx.tray_events.to_async(),
+            pending_adds: Arc::new(RwLock::new(Vec::new())),
             waker: ctx.waker,
         }
     }
 
-    pub fn drain_intents(&self) -> Vec<UiIntent> {
-        self.ui_rx.try_iter().collect()
+    pub fn clear_error(&mut self) {
+        self.error.clear();
+        self.push_frame();
     }
 
     pub fn config_snapshot(&self) -> Rc<Config> {
         Rc::clone(&self.config)
-    }
-
-    pub fn seed(&self) {
-        self.push_frame();
     }
 
     pub fn set_status(&mut self, status: hermes::StatusSnapshot) {
@@ -141,7 +140,8 @@ impl WorkState {
     }
 
     /// Validates an add request. Returns the normalized login when a resolve
-    /// is worthwhile; duplicates and empty input are silently ignored.
+    /// is worthwhile; duplicates, in-flight resolves, and empty input are
+    /// silently ignored.
     pub fn begin_add_login(&mut self, login: &str) -> Option<String> {
         let login = login.trim().to_lowercase();
         if login.is_empty()
@@ -152,6 +152,14 @@ impl WorkState {
                 .any(|channel| channel.login.eq_ignore_ascii_case(&login))
         {
             return None;
+        }
+        if let Ok(pending) = self.pending_adds.read()
+            && pending.iter().any(|item| item.eq_ignore_ascii_case(&login))
+        {
+            return None;
+        }
+        if let Ok(mut v) = self.pending_adds.write() {
+            v.push(login.clone());
         }
         self.error.clear();
         self.push_frame();
@@ -168,7 +176,11 @@ impl WorkState {
         result: Result<Vec<gql::User>, gql::Error>,
     ) {
         let pending = work.borrow_mut().stage_finish_add_login(&login, result);
+        let finished_without_save = pending.is_none();
         Self::commit_save(work, pending).await;
+        if finished_without_save {
+            work.borrow().push_frame();
+        }
     }
 
     pub async fn apply_remove_channel(work: &Rc<RefCell<Self>>, id: u64) {
@@ -252,6 +264,9 @@ impl WorkState {
     ) -> Option<PendingSave> {
         match result {
             Ok(users) => {
+                if let Ok(mut v) = self.pending_adds.write() {
+                    v.retain(|item| !item.eq_ignore_ascii_case(login));
+                }
                 let user = users
                     .into_iter()
                     .find(|user| user.channel_name.eq_ignore_ascii_case(login));
@@ -288,6 +303,9 @@ impl WorkState {
                 Some(self.stage_save(hermes::Command::AddChannel(forward_login)))
             }
             Err(error) => {
+                if let Ok(mut v) = self.pending_adds.write() {
+                    v.retain(|item| !item.eq_ignore_ascii_case(login));
+                }
                 log::info!(target: "config", "channel resolution failed: {error}");
                 self.set_error(format!("failed to resolve {login}: {error}"));
                 None
@@ -343,7 +361,7 @@ impl WorkState {
     }
 
     fn forward(&self, command: hermes::Command) {
-        if let Err(error) = self.session_tx.unbounded_send(command) {
+        if let Err(error) = self.session_tx.send(command) {
             // The session owns the receiver for the runtime lifetime, so a
             // send failure is unexpected; surface it rather than dropping it.
             log::info!(target: "config", "hermes command send failed: {error}");
@@ -355,7 +373,7 @@ impl WorkState {
         self.push_frame();
     }
 
-    fn push_frame(&self) {
+    pub fn push_frame(&self) {
         let _ = self.frame_tx.send(FrameState {
             config: self.config.as_ref().clone(),
             status: self.status.clone(),
@@ -377,14 +395,12 @@ mod tests {
     fn test_work(
         config: Config,
         path: PathBuf,
-    ) -> (
-        Rc<RefCell<WorkState>>,
-        futures_channel::mpsc::UnboundedReceiver<hermes::Command>,
-    ) {
-        let (_ui_tx, ui_rx) = crossbeam_channel::unbounded();
-        let (frame_tx, _frame_rx) = crossbeam_channel::unbounded();
-        let (tray_tx, _tray_rx) = crossbeam_channel::unbounded();
-        let (session_tx, session_rx) = futures_channel::mpsc::unbounded();
+    ) -> (Rc<RefCell<WorkState>>, Receiver<hermes::Command>) {
+        let (_ui_tx, ui_rx) = kanal::unbounded();
+        let (frame_tx, _frame_rx) = kanal::unbounded();
+        let (tray_tx, _tray_rx) = kanal::unbounded();
+        let (_tray_event_tx, tray_events) = kanal::unbounded();
+        let (session_tx, session_rx) = kanal::unbounded();
         let work = Rc::new(RefCell::new(WorkState::new(
             WorkContext {
                 config_path: path,
@@ -392,6 +408,7 @@ mod tests {
                 ui_rx,
                 frame_tx,
                 tray_tx,
+                tray_events,
                 waker: GuiWaker::new(),
             },
             session_tx,
@@ -432,7 +449,7 @@ mod tests {
             channels: vec![channel("alice", 1), channel("bob", 2)],
             ..Config::default()
         };
-        let (work, mut session_rx) = test_work(config, path.clone());
+        let (work, session_rx) = test_work(config, path.clone());
 
         block_on(async {
             compio::fs::remove_file(&path).await.ok();
@@ -447,7 +464,10 @@ mod tests {
                     .collect::<Vec<_>>(),
                 ["bob"]
             );
-            let command = session_rx.try_recv().expect("command forwarded");
+            let command = session_rx
+                .try_recv()
+                .expect("channel open")
+                .expect("command forwarded");
             assert!(matches!(command, hermes::Command::RemoveChannel(id) if id == 1));
             compio::fs::remove_file(&path).await.ok();
         });
@@ -457,7 +477,7 @@ mod tests {
     fn finish_add_login_persists_resolved_channel() {
         let path =
             std::env::temp_dir().join(format!("siphon-state-add-{}.json", std::process::id()));
-        let (work, mut session_rx) = test_work(Config::default(), path.clone());
+        let (work, session_rx) = test_work(Config::default(), path.clone());
         let user = gql::User {
             channel_id: 7,
             channel_name: "alice".to_owned(),
@@ -478,7 +498,10 @@ mod tests {
             assert_eq!(saved.channels.len(), 1);
             assert_eq!(saved.channels[0].login, "alice");
             assert_eq!(saved.channels[0].id, 7);
-            let command = session_rx.try_recv().expect("command forwarded");
+            let command = session_rx
+                .try_recv()
+                .expect("channel open")
+                .expect("command forwarded");
             assert!(matches!(command, hermes::Command::AddChannel(login) if login == "alice"));
             compio::fs::remove_file(&path).await.ok();
         });
@@ -488,10 +511,11 @@ mod tests {
     fn finish_add_login_surfaces_error_without_touching_disk() {
         let path =
             std::env::temp_dir().join(format!("siphon-state-typo-{}.json", std::process::id()));
-        let (frame_tx, frame_rx) = crossbeam_channel::unbounded();
-        let (tray_tx, _tray_rx) = crossbeam_channel::unbounded();
-        let (_ui_tx, ui_rx) = crossbeam_channel::unbounded();
-        let (session_tx, mut session_rx) = futures_channel::mpsc::unbounded();
+        let (frame_tx, frame_rx) = kanal::unbounded();
+        let (tray_tx, _tray_rx) = kanal::unbounded();
+        let (_ui_tx, ui_rx) = kanal::unbounded();
+        let (_tray_event_tx, tray_events) = kanal::unbounded();
+        let (session_tx, session_rx) = kanal::unbounded();
         let work = Rc::new(RefCell::new(WorkState::new(
             WorkContext {
                 config_path: path.clone(),
@@ -499,6 +523,7 @@ mod tests {
                 ui_rx,
                 frame_tx,
                 tray_tx,
+                tray_events,
                 waker: GuiWaker::new(),
             },
             session_tx,
@@ -513,10 +538,13 @@ mod tests {
                 "typos must not create a config file"
             );
             assert!(
-                session_rx.try_recv().is_err(),
+                session_rx.is_empty(),
                 "unresolvable logins must not reach the session"
             );
-            let frame = frame_rx.try_recv().expect("error frame pushed");
+            let frame = frame_rx
+                .try_recv()
+                .expect("channel open")
+                .expect("error frame pushed");
             assert!(
                 !frame.error.is_empty(),
                 "unresolvable logins must surface an error"
@@ -532,10 +560,11 @@ mod tests {
             channels: vec![channel("alice", 1), channel("bob", 2)],
             ..Config::default()
         };
-        let (frame_tx, frame_rx) = crossbeam_channel::unbounded();
-        let (tray_tx, _tray_rx) = crossbeam_channel::unbounded();
-        let (_ui_tx, ui_rx) = crossbeam_channel::unbounded();
-        let (session_tx, _session_rx) = futures_channel::mpsc::unbounded();
+        let (frame_tx, frame_rx) = kanal::unbounded();
+        let (tray_tx, _tray_rx) = kanal::unbounded();
+        let (_ui_tx, ui_rx) = kanal::unbounded();
+        let (_tray_event_tx, tray_events) = kanal::unbounded();
+        let (session_tx, _session_rx) = kanal::unbounded::<hermes::Command>();
         let work = Rc::new(RefCell::new(WorkState::new(
             WorkContext {
                 config_path: path.clone(),
@@ -543,6 +572,7 @@ mod tests {
                 ui_rx,
                 frame_tx,
                 tray_tx,
+                tray_events,
                 waker: GuiWaker::new(),
             },
             session_tx,
@@ -550,7 +580,8 @@ mod tests {
 
         block_on(async {
             compio::fs::remove_file(&path).await.ok();
-            work.borrow().config.save(&path).await.unwrap();
+            let config = work.borrow().config.clone();
+            config.save(&path).await.unwrap();
             WorkState::apply_prune_ids(&work, &[1]).await;
 
             let saved = saved_config(&path).await;
@@ -562,7 +593,11 @@ mod tests {
                     .collect::<Vec<_>>(),
                 ["bob"]
             );
-            let frame = frame_rx.try_iter().last().expect("frame pushed");
+            let mut last = None;
+            while let Ok(Some(frame)) = frame_rx.try_recv() {
+                last = Some(frame);
+            }
+            let frame = last.expect("frame pushed");
             assert_eq!(frame.config.channels.len(), 1);
             assert!(
                 !frame.error.is_empty(),

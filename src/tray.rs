@@ -7,9 +7,10 @@
 //! The `Tray` value must stay alive for the icon to remain: dropping it
 //! removes the icon, and `Tray` always owns one — absence of a tray is
 //! `Option<Tray>::None` at the call site, never a flag inside `Tray`.
-//! Events arrive on `tray-icon`'s global channels; the work thread's poll
-//! task drains them via [`drain_pending`], since `eframe` never polls those
-//! channels on its own.
+//! Events arrive on `tray-icon`'s global channels; [`spawn_proxy`] pumps them
+//! into a [`kanal`] channel with blocking `recv` on two threads, so the work
+//! task awaits tray events instead of polling, since `eframe` never polls
+//! those channels on its own.
 
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -72,28 +73,47 @@ pub fn build() -> Result<Tray, String> {
     Ok(Tray { _icon: icon })
 }
 
-/// Non-blocking drain of pending tray/menu events. The global receivers
-/// never disconnect, so an empty vec means idle.
-pub fn drain_pending() -> Vec<TrayAction> {
-    let mut actions = Vec::new();
-    for event in TrayIconEvent::receiver().try_iter() {
-        if matches!(
-            event,
-            TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up | MouseButtonState::Down,
-                ..
+/// Pumps the `tray-icon` global receivers into a [`kanal`] channel. Both
+/// receivers are `crossbeam_channel` channels under the hood, so one thread
+/// blocks on both with `select!` and forwards mapped [`TrayAction`]s with an
+/// unbounded send that never blocks; the work task awaits the returned
+/// receiver alongside UI intents, so no polling. The thread detaches:
+/// process exit cleans it up.
+pub fn spawn_proxy() -> kanal::Receiver<TrayAction> {
+    let (tx, rx) = kanal::unbounded::<TrayAction>();
+    let _proxy_thread = std::thread::Builder::new()
+        .name("tray-proxy".to_owned())
+        .spawn(move || {
+            let click_rx = TrayIconEvent::receiver();
+            let menu_rx = MenuEvent::receiver();
+            loop {
+                crossbeam_channel::select! {
+                    recv(click_rx) -> event => {
+                        let Ok(event) = event else { break };
+                        if matches!(
+                            event,
+                            TrayIconEvent::Click {
+                                button: MouseButton::Left,
+                                button_state: MouseButtonState::Up | MouseButtonState::Down,
+                                ..
+                            }
+                        ) {
+                            let _ = tx.send(TrayAction::Show);
+                        }
+                    }
+                    recv(menu_rx) -> event => {
+                        let Ok(event) = event else { break };
+                        let action = if event.id.as_ref() == MENU_QUIT_ID {
+                            TrayAction::Quit
+                        } else if event.id.as_ref() == MENU_OPEN_ID {
+                            TrayAction::Show
+                        } else {
+                            continue;
+                        };
+                        let _ = tx.send(action);
+                    }
+                }
             }
-        ) {
-            actions.push(TrayAction::Show);
-        }
-    }
-    for event in MenuEvent::receiver().try_iter() {
-        if event.id.as_ref() == MENU_QUIT_ID {
-            actions.push(TrayAction::Quit);
-        } else if event.id.as_ref() == MENU_OPEN_ID {
-            actions.push(TrayAction::Show);
-        }
-    }
-    actions
+        });
+    rx
 }

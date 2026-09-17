@@ -2,7 +2,7 @@ use compio::fs::File;
 use compio::io::AsyncWriteAtExt;
 use futures_util::StreamExt;
 use serde::{Deserialize, Deserializer};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::error::Error as StdError;
 use std::path::Path;
 use std::time::Duration;

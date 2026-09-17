@@ -4,12 +4,50 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   build-windows:
+    # Cross-compile for Windows on the self-hosted Fedora runner with
+    # cargo-xwin (MSVC CRT and Windows SDK are auto-downloaded; this
+    # consents to the MS license at
+    # https://go.microsoft.com/fwlink/?LinkId=2086102).
+    # Toolchain (Rust target, xwin, system deps) is pre-installed on the runner.
+    runs-on: [self-hosted, fedora-release]
+    env:
+      # Only fetch the x86_64 CRT/SDK, not aarch64.
+      XWIN_ARCH: x86_64
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: cross-build Windows binary
+        run: cargo xwin build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: prepare portable binary
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+          cp "target/x86_64-pc-windows-msvc/release/siphon.exe" "Siphon_${version}_x64-portable.exe"
+
+      - name: upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-bin
+          path: |
+            target/x86_64-pc-windows-msvc/release/siphon.exe
+            Siphon_*-portable.exe
+
+  package-msi:
+    # WiX (candle/light) only runs on Windows, so this job just packages the
+    # cross-built binary; nothing is compiled here.
+    needs: build-windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -17,23 +55,55 @@ jobs:
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+      - name: download Windows binary
+        uses: actions/download-artifact@v4
         with:
-          workspaces: src-tauri
+          name: windows-bin
+          path: windows-bin
 
-      - name: build portable binary
-        run: cargo build --release --locked
-        working-directory: src-tauri
+      - name: install cargo-packager
+        run: cargo install cargo-packager --locked
 
-      - name: prepare portable binary
+      - name: stage binary for packager
         run: |
-          $version = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "([^"]+)"').Matches.Groups[1].Value
-          Copy-Item "src-tauri/target/release/siphon.exe" "Siphon_${version}_x64-portable.exe"
+          New-Item -ItemType Directory -Force target/release | Out-Null
+          Copy-Item windows-bin/siphon.exe target/release/siphon.exe
 
-      - name: upload portable binary
+      - name: package MSI
+        # WiX 3.11 toolchain is auto-downloaded by cargo-packager.
+        run: cargo packager --release --formats wix
+
+      - name: upload Windows artifacts
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          files: Siphon_*-portable.exe
+          files: |
+            windows-bin/Siphon_*-portable.exe
+            target/release/*.msi
+          draft: true
+
+  build-linux:
+    # System deps and cargo-packager are pre-installed on the self-hosted runner.
+    runs-on: [self-hosted, fedora-release]
+    # linuxdeploy/appimagetool run as extracted AppImages: no FUSE needed
+    # natively, but keep this set in case FUSE is unavailable.
+    env:
+      APPIMAGE_EXTRACT_AND_RUN: 1
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: build release binary
+        run: cargo build --release --locked
+
+      - name: package AppImage
+        run: cargo packager --release --formats appimage
+
+      - name: upload Linux artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: target/release/*.AppImage
           draft: true

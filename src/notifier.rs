@@ -146,11 +146,11 @@ async fn resolve_image(image: Option<&str>) -> Option<String> {
     let dir = std::env::temp_dir().join("twitch-siphon-avatars");
     compio::fs::create_dir_all(&dir).await.ok()?;
     let path = dir.join(file_name);
-    if compio::fs::metadata(&path).await.is_err() {
-        if let Err(error) = gql::fetch_file(url, &path).await {
-            log::info!(target: "notifier", "failed to download avatar: {error}");
-            return None;
-        }
+    if compio::fs::metadata(&path).await.is_err()
+        && let Err(error) = gql::fetch_file(url, &path).await
+    {
+        log::info!(target: "notifier", "failed to download avatar: {error}");
+        return None;
     }
     path.into_os_string().into_string().ok()
 }

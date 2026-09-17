@@ -1,28 +1,25 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use compio::net::TcpStream;
 use compio::ws::tungstenite::Message;
-use compio::ws::{connect_async, WebSocketStream};
-use futures_channel::mpsc;
-use futures_util::stream::FuturesUnordered;
+use compio::ws::{WebSocketStream, connect_async};
 use futures_util::{FutureExt as _, StreamExt as _};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+
+use crate::balesh::{NanoId, Rng, Topic};
 
 use crate::gql::{self, Game, User};
 use crate::notifier;
-use crate::state::{UiIntent, WorkContext, WorkState};
-use crate::tray;
+use crate::state::WorkState;
 
 const HERMES_URL: &str = "wss://hermes.twitch.tv/v1?clientId=kimne78kx3ncx6brgo4mv6wki5h1ko";
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
 const KEEPALIVE_MISSED_LIMIT: u64 = 2;
-const TOPIC_PREFIXES: [&str; 2] = ["broadcast-settings-update", "video-playback-by-id"];
 
 pub enum Command {
     AddChannel(String),
@@ -59,113 +56,15 @@ pub struct StatusSnapshot {
     pub connected: bool,
     pub error: Option<String>,
     pub channels: Vec<ChannelStatus>,
+    pub pending_adds: Arc<RwLock<Vec<String>>>,
 }
 
 struct Sub {
-    id: String,
+    id: NanoId,
     state: SubState,
 }
 
 type WsStream = WebSocketStream<TcpStream>;
-
-/// How often the poll task drains the sync inboxes (ui intents, tray
-/// events). Bounds click-to-effect latency; the runtime otherwise sleeps.
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// One finished channel resolve: the login plus the gql result.
-type ResolveDone = (String, Result<Vec<User>, gql::Error>);
-/// In-flight resolve future. `!Send` is fine: everything stays on this one
-/// thread-per-core runtime thread.
-type ResolveFuture = Pin<Box<dyn Future<Output = ResolveDone>>>;
-
-/// Drives the whole work side on the calling thread, which must be a
-/// dedicated OS thread owning this compio runtime: the hermes session plus a
-/// poll routine that bridges the sync inboxes (GUI intents, tray events) into
-/// it. Everything here is single-threaded (`Rc`, no `Mutex`); crossbeam
-/// channels are the only bridge to the GUI thread.
-///
-/// This function never returns (both routines run until the process exits);
-/// the caller owns thread creation so this module never spawns anything.
-pub fn run(ctx: WorkContext) {
-    compio::runtime::Runtime::new()
-        .expect("compio runtime")
-        .block_on(async move {
-            let (session_tx, command_rx) = mpsc::unbounded();
-            let work = Rc::new(RefCell::new(WorkState::new(ctx, session_tx)));
-            work.borrow().seed();
-            let mut session = Session::new(Rc::clone(&work), command_rx);
-            // Joined, not spawned: both routines are polled on this one
-            // thread until the process exits.
-            futures_util::future::join(poll_loop(work), session.main_loop()).await;
-        });
-}
-
-/// Bridges the sync inboxes into the runtime: drains UI intents and tray
-/// events with non-blocking `try_recv` on a short interval, so neither the
-/// GUI thread nor this runtime ever blocks. Intent handling is synchronous;
-/// resolves wait in a `FuturesUnordered` polled by this same routine, so no
-/// task is ever spawned.
-///
-/// The `select!` over the boxed resolve stream trips `tail_expr_drop_order`
-/// (boxed `dyn Future` counts as a custom destructor); drop order is
-/// irrelevant here, and the crate is edition 2021, so the lint is allowed
-/// locally instead of restructuring the poll.
-#[allow(tail_expr_drop_order)]
-async fn poll_loop(work: Rc<RefCell<WorkState>>) {
-    let mut tick = compio::time::interval(POLL_INTERVAL);
-    let mut pending: FuturesUnordered<ResolveFuture> = FuturesUnordered::new();
-    loop {
-        if pending.is_empty() {
-            tick.tick().await;
-            drain_once(&work, &pending).await;
-        } else {
-            let tick_fut = tick.tick().fuse();
-            let next_fut = pending.next().fuse();
-            futures_util::pin_mut!(tick_fut, next_fut);
-            futures_util::select! {
-                _ = tick_fut => {
-                    drain_once(&work, &pending).await;
-                }
-                done = next_fut => {
-                    if let Some((login, result)) = done {
-                        WorkState::finish_add_login(&work, login, result).await;
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// One poll tick: drains UI intents (queuing resolves instead of spawning
-/// them) and tray events.
-async fn drain_once(work: &Rc<RefCell<WorkState>>, pending: &FuturesUnordered<ResolveFuture>) {
-    // Owned up front: the `Ref` must not survive into the awaits below.
-    let intents: Vec<UiIntent> = work.borrow().drain_intents();
-    for intent in intents {
-        match intent {
-            UiIntent::AddLogin(login) => {
-                if let Some(login) = work.borrow_mut().begin_add_login(&login) {
-                    pending.push(Box::pin(async move {
-                        let users = gql::fetch_users(&[], std::slice::from_ref(&login)).await;
-                        (login, users)
-                    }));
-                }
-            }
-            UiIntent::RemoveChannel(id) => {
-                WorkState::apply_remove_channel(work, id).await;
-            }
-            UiIntent::SetNotifyTitleChanges(value) => {
-                WorkState::apply_notify_title_changes(work, value).await;
-            }
-            UiIntent::SetSound(value) => {
-                WorkState::apply_sound(work, value).await;
-            }
-        }
-    }
-    for action in tray::drain_pending() {
-        work.borrow().forward_tray(action);
-    }
-}
 
 /// Notification preferences the ui can change at runtime.
 struct Preferences {
@@ -173,11 +72,11 @@ struct Preferences {
     sound: bool,
 }
 
-struct Session {
+pub struct Session {
     work: Rc<RefCell<WorkState>>,
-    command_rx: mpsc::UnboundedReceiver<Command>,
+    command_rx: kanal::AsyncReceiver<Command>,
     channels: HashMap<u64, User>,
-    subs: HashMap<String, Sub>,
+    subs: HashMap<Topic, Sub>,
     preferences: Preferences,
     socket: Option<WsStream>,
     welcomed: bool,
@@ -185,12 +84,11 @@ struct Session {
     last_message: Instant,
     reconnect_at: Instant,
     reconnect_attempt: u32,
-    /// `SplitMix64` state for [`Session::nano_id`]
-    rng_state: u64,
+    rng: Rng,
 }
 
 impl Session {
-    fn new(work: Rc<RefCell<WorkState>>, command_rx: mpsc::UnboundedReceiver<Command>) -> Self {
+    pub fn new(work: Rc<RefCell<WorkState>>, command_rx: kanal::AsyncReceiver<Command>) -> Self {
         let (notify_title_changes, sound) = {
             let work = work.borrow();
             (
@@ -207,26 +105,32 @@ impl Session {
                 notify_title_changes,
                 sound,
             },
+
             socket: None,
             welcomed: false,
             keepalive_secs: 15,
             last_message: Instant::now(),
             reconnect_at: Instant::now(),
             reconnect_attempt: 0,
-            rng_state: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0x853c_49e6_748f_ea9b, |elapsed| elapsed.as_nanos() as u64),
+            rng: Rng::new(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0x853c_49e6_748f_ea9b, |elapsed| elapsed.as_nanos() as u64),
+            ),
         }
     }
 
-    async fn main_loop(&mut self) {
+    pub async fn run(&mut self) {
         log::info!(target: "hermes", "worker started");
         let mut tick = compio::time::interval(Duration::from_secs(1));
+        // Owned by the loop, not `self`: the recv future must not borrow
+        // `self` while command/socket handling takes `&mut self`.
+        let command_rx = self.command_rx.clone();
         loop {
             if self.socket.is_none() && self.has_work() && Instant::now() >= self.reconnect_at {
                 self.connect().await;
             }
-            let command_fut = self.command_rx.next().fuse();
+            let command_fut = command_rx.recv().fuse();
             let socket_fut = async {
                 match self.socket.as_mut() {
                     Some(socket) => socket.next().await,
@@ -238,7 +142,7 @@ impl Session {
             futures_util::pin_mut!(command_fut, socket_fut, tick_fut);
             futures_util::select! {
                 command = command_fut => {
-                    let Some(command) = command else { return };
+                    let Ok(command) = command else { return };
                     self.on_command(command).await;
                 }
                 message = socket_fut => {
@@ -355,11 +259,10 @@ impl Session {
     async fn remove_channel(&mut self, id: u64) {
         if let Some(user) = self.channels.remove(&id) {
             log::info!(target: "hermes", "channel {} removed", user.channel_name);
-            for prefix in TOPIC_PREFIXES {
-                let topic = format!("{prefix}.{id}");
+            for topic in Topic::for_channel(id) {
                 if let Some(sub) = self.subs.remove(&topic) {
                     log::info!(target: "hermes", "unsubscribing from {topic}");
-                    let message_id = self.nano_id();
+                    let message_id = self.rng.nano_id();
                     self.send_message(&json!({
                         "type": "unsubscribe",
                         "id": message_id,
@@ -378,8 +281,8 @@ impl Session {
     /// the server would still recognize. Welcome replays never see it again.
     fn drop_channel(&mut self, id: u64) {
         self.channels.remove(&id);
-        for prefix in TOPIC_PREFIXES {
-            self.subs.remove(&format!("{prefix}.{id}"));
+        for topic in Topic::for_channel(id) {
+            self.subs.remove(&topic);
         }
     }
 
@@ -472,19 +375,11 @@ impl Session {
     /// Registers a channel's two topics if not registered already. Entries
     /// persist across reconnects; every welcome replays the whole map.
     fn ensure_subs(&mut self, id: u64) {
-        for prefix in TOPIC_PREFIXES {
-            let topic = format!("{prefix}.{id}");
-            if self.subs.contains_key(&topic) {
-                continue;
-            }
-            let sub_id = self.nano_id();
-            self.subs.insert(
-                topic,
-                Sub {
-                    id: sub_id,
-                    state: SubState::Pending,
-                },
-            );
+        for topic in Topic::for_channel(id) {
+            self.subs.entry(topic).or_insert_with(|| Sub {
+                id: self.rng.nano_id(),
+                state: SubState::Pending,
+            });
         }
     }
 
@@ -573,24 +468,21 @@ impl Session {
             }
             Some("keepalive") => {}
             Some("subscribeResponse") => {
-                let Some(subscription_id) =
-                    message["subscribeResponse"]["subscription"]["id"].as_str()
+                let Some(target) = message["subscribeResponse"]["subscription"]["id"]
+                    .as_str()
+                    .and_then(NanoId::parse)
                 else {
                     return;
                 };
                 let ok = message["subscribeResponse"]["result"].as_str() == Some("ok");
-                let topic = match self
-                    .subs
-                    .iter_mut()
-                    .find(|(_, sub)| sub.id == subscription_id)
-                {
+                let topic = match self.subs.iter_mut().find(|(_, sub)| sub.id == target) {
                     Some((topic, sub)) => {
                         sub.state = if ok {
                             SubState::Subscribed
                         } else {
                             SubState::Failed
                         };
-                        topic.clone()
+                        *topic
                     }
                     None => return,
                 };
@@ -611,26 +503,25 @@ impl Session {
 
     async fn resubscribe_all(&mut self) {
         log::info!(target: "hermes", "replaying {} topic(s)", self.subs.len());
-        let pending: Vec<(String, String)> = self
+        let pending: Vec<(NanoId, Topic)> = self
             .subs
             .iter_mut()
             .map(|(topic, sub)| {
                 sub.state = SubState::Pending;
-                (sub.id.clone(), topic.clone())
+                (sub.id, *topic)
             })
             .collect();
         for (sub_id, topic) in pending {
-            self.send_subscribe(&sub_id, &topic).await;
+            self.send_subscribe(sub_id, topic).await;
         }
     }
 
     /// Subscribes a single channel's topics; used when a channel is added
     /// to an already-live session (welcomes replay everything instead).
     async fn subscribe_channel(&mut self, id: u64) {
-        let pending: Vec<(String, String)> = TOPIC_PREFIXES
-            .iter()
-            .map(|prefix| format!("{prefix}.{id}"))
-            .filter_map(|topic| self.subs.get(&topic).map(|sub| (sub.id.clone(), topic)))
+        let pending: Vec<(NanoId, Topic)> = Topic::for_channel(id)
+            .into_iter()
+            .filter_map(|topic| self.subs.get(&topic).map(|sub| (sub.id, topic)))
             .collect();
         if !pending.is_empty() {
             log::info!(
@@ -640,20 +531,20 @@ impl Session {
             );
         }
         for (sub_id, topic) in pending {
-            self.send_subscribe(&sub_id, &topic).await;
+            self.send_subscribe(sub_id, topic).await;
         }
     }
 
-    async fn send_subscribe(&mut self, subscription_id: &str, topic: &str) {
+    async fn send_subscribe(&mut self, subscription_id: NanoId, topic: Topic) {
         log::info!(target: "hermes", "subscribing to {topic}");
-        let id = self.nano_id();
+        let id = self.rng.nano_id();
         self.send_message(&json!({
             "type": "subscribe",
             "id": id,
             "subscribe": {
                 "id": subscription_id,
                 "type": "pubsub",
-                "pubsub": { "topic": topic },
+                "pubsub": { "topic": topic.to_string() },
             },
             "timestamp": crate::logging::timestamp(),
         }))
@@ -671,26 +562,23 @@ impl Session {
     }
 
     async fn handle_notification(&mut self, message: &Value) {
-        let Some(subscription_id) = message["notification"]["subscription"]["id"].as_str() else {
+        let Some(target) = message["notification"]["subscription"]["id"]
+            .as_str()
+            .and_then(NanoId::parse)
+        else {
             return;
         };
         let Some((topic, state)) = self
             .subs
             .iter()
-            .find(|(_, sub)| sub.id == subscription_id)
-            .map(|(topic, sub)| (topic.clone(), sub.state))
+            .find(|(_, sub)| sub.id == target)
+            .map(|(topic, sub)| (*topic, sub.state))
         else {
             return;
         };
         if state != SubState::Subscribed {
             return;
         }
-        let Some((kind, channel_id)) = topic.split_once('.') else {
-            return;
-        };
-        let Ok(channel_id) = channel_id.parse::<u64>() else {
-            return;
-        };
         let Ok(pubsub) =
             serde_json::from_str::<Value>(message["notification"]["pubsub"].as_str().unwrap_or(""))
         else {
@@ -701,12 +589,13 @@ impl Session {
             "notification on {topic}: {}",
             serde_json::to_string(&pubsub).unwrap_or_default()
         );
-        match kind {
-            "broadcast-settings-update" => {
+        match topic {
+            Topic::BroadcastSettingsUpdate(channel_id) => {
                 self.on_broadcast_settings_update(channel_id, &pubsub).await;
             }
-            "video-playback-by-id" => self.on_video_playback(channel_id, &pubsub).await,
-            _ => {}
+            Topic::VideoPlaybackById(channel_id) => {
+                self.on_video_playback(channel_id, &pubsub).await;
+            }
         }
     }
 
@@ -856,12 +745,8 @@ impl Session {
         .await;
     }
 
-    fn status_for(&self, prefix: &str, id: u64) -> SubStatus {
-        match self
-            .subs
-            .get(&format!("{prefix}.{id}"))
-            .map(|sub| sub.state)
-        {
+    fn status_for(&self, topic: Topic) -> SubStatus {
+        match self.subs.get(&topic).map(|sub| sub.state) {
             None | Some(SubState::Pending) => SubStatus::Pending,
             Some(SubState::Subscribed) => SubStatus::Connected,
             Some(SubState::Failed) => SubStatus::Failed,
@@ -876,8 +761,8 @@ impl Session {
                 channel_id: *id,
                 login: user.channel_name.clone(),
                 display_name: user.channel_display_name.clone(),
-                title_status: self.status_for("broadcast-settings-update", *id),
-                live_status: self.status_for("video-playback-by-id", *id),
+                title_status: self.status_for(Topic::BroadcastSettingsUpdate(*id)),
+                live_status: self.status_for(Topic::VideoPlaybackById(*id)),
             })
             .collect();
         channels.sort_by(|left, right| left.login.cmp(&right.login));
@@ -885,32 +770,8 @@ impl Session {
             connected: self.socket.is_some() && self.welcomed,
             error: error.map(String::from),
             channels,
+            pending_adds: self.work.borrow().pending_adds.clone(),
         };
         self.work.borrow_mut().set_status(status);
-    }
-
-    fn nano_id(&mut self) -> String {
-        const ALPHABET: &[u8; 64] =
-            b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_-";
-        const LEN: usize = 21;
-        let mut acc: u128 = (u128::from(self.next_u64()) << 64) | u128::from(self.next_u64());
-        let mut out = String::with_capacity(LEN);
-        for _ in 0..LEN {
-            out.push(ALPHABET[(acc & 63) as usize] as char);
-            acc >>= 6;
-        }
-        out
-    }
-
-    /// One `SplitMix64` step (Steele et al.) over the session seed. Zero is
-    /// a valid state and nearby seeds decorrelate immediately, which suits
-    /// a wall-clock-seeded `u64`.
-    #[allow(clippy::missing_const_for_fn)]
-    fn next_u64(&mut self) -> u64 {
-        self.rng_state = self.rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.rng_state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
     }
 }
