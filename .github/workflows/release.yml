@@ -25,6 +25,10 @@ jobs:
       CARGO_INCREMENTAL: 1
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Default clean wipes untracked files (i.e. target/) every run,
+          # defeating the persistent workspace on this runner.
+          clean: false
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -112,6 +116,9 @@ jobs:
       CARGO_INCREMENTAL: 1
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Same as above: keep target/ across runs.
+          clean: false
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
