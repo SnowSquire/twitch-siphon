@@ -40,6 +40,9 @@ jobs:
 
       - name: prepare portable binary
         run: |
+          # Workspace persists across runs: drop stale versioned artifacts
+          # so wildcards below only ever match the current version.
+          rm -rf dist Siphon_*-portable.exe
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
           cp "target/x86_64-pc-windows-msvc/release/siphon.exe" "Siphon_${version}_x64-portable.exe"
           # Stage into dist/ so the artifact has a flat, predictable layout
