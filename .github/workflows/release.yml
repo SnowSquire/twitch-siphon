@@ -35,14 +35,17 @@ jobs:
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
           cp "target/x86_64-pc-windows-msvc/release/siphon.exe" "Siphon_${version}_x64-portable.exe"
+          # Stage into dist/ so the artifact has a flat, predictable layout
+          # (upload-artifact preserves workspace-relative paths otherwise).
+          mkdir -p dist
+          cp target/x86_64-pc-windows-msvc/release/siphon.exe dist/siphon.exe
+          cp "Siphon_${version}_x64-portable.exe" dist/
 
       - name: upload Windows binary
         uses: actions/upload-artifact@v4
         with:
           name: windows-bin
-          path: |
-            target/x86_64-pc-windows-msvc/release/siphon.exe
-            Siphon_*-portable.exe
+          path: dist
 
   package-msi:
     # WiX (candle/light) only runs on Windows, so this job just packages the
