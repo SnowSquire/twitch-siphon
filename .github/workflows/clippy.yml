@@ -1,0 +1,27 @@
+name: clippy
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc pkg-config libgl-dev libegl-dev libwayland-dev libxkbcommon-dev
+
+      # Workspace lints already deny warnings; plain clippy is enough.
+      - name: clippy
+        run: cargo clippy --all-targets --locked
