@@ -20,6 +20,9 @@ jobs:
     env:
       # Only fetch the x86_64 CRT/SDK, not aarch64.
       XWIN_ARCH: x86_64
+      # The Actions environment forces CARGO_INCREMENTAL=0; re-enable it
+      # since this runner keeps a persistent target/ dir.
+      CARGO_INCREMENTAL: 1
     steps:
       - uses: actions/checkout@v7
 
@@ -92,6 +95,9 @@ jobs:
     # natively, but keep this set in case FUSE is unavailable.
     env:
       APPIMAGE_EXTRACT_AND_RUN: 1
+      # The Actions environment forces CARGO_INCREMENTAL=0; re-enable it
+      # since this runner keeps a persistent target/ dir.
+      CARGO_INCREMENTAL: 1
     steps:
       - uses: actions/checkout@v7
 
