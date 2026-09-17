@@ -10,6 +10,30 @@ permissions:
   contents: write
 
 jobs:
+  # Single source for the release tag/title both uploaders share. Tag pushes
+  # reuse the pushed tag. Manual runs have no tag, so mint `<utc-date>@<sha>`:
+  # unique per run and never a branch name. Colons are illegal in git tags, so
+  # the tag uses `-` separators while the title keeps ISO-8601 `:`.
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.names.outputs.tag }}
+      title: ${{ steps.names.outputs.title }}
+    steps:
+      - name: resolve release tag and title
+        id: names
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "title=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            stamp=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+            pretty=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            short="${GITHUB_SHA:0:8}"
+            echo "tag=${stamp}@${short}" >> "$GITHUB_OUTPUT"
+            echo "title=${pretty} @ ${short}" >> "$GITHUB_OUTPUT"
+          fi
+
   build-windows:
     # Cross-compile for Windows on the self-hosted Fedora runner with
     # cargo-xwin (MSVC CRT and Windows SDK are auto-downloaded; this
@@ -60,7 +84,7 @@ jobs:
   package-msi:
     # WiX (candle/light) only runs on Windows, so this job just packages the
     # cross-built binary; nothing is compiled here.
-    needs: build-windows
+    needs: [build-windows, setup]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -97,13 +121,15 @@ jobs:
       - name: upload Windows artifacts
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.setup.outputs.tag }}
+          name: ${{ needs.setup.outputs.title }}
           files: |
             windows-bin/Siphon_*-portable.exe
             target/release/*.msi
           draft: true
 
   build-linux:
+    needs: setup
     # System deps and cargo-packager are pre-installed on the self-hosted runner.
     runs-on: [self-hosted, fedora-release]
     # linuxdeploy/appimagetool run as extracted AppImages: no FUSE needed
@@ -135,6 +161,7 @@ jobs:
       - name: upload Linux artifacts
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.setup.outputs.tag }}
+          name: ${{ needs.setup.outputs.title }}
           files: target/release/*.AppImage
           draft: true

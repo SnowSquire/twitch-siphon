@@ -85,6 +85,12 @@ category = "Utility"
 licenseFile = "LICENSE"
 icons = ["icons/icon.ico", "icons/icon.png"]
 
+# Per-user MSI: cargo-packager has no install-scope option, so the WiX
+# template is overridden (see packaging/wix/main.wxs). Installs to
+# %LocalAppData% without elevation.
+[package.metadata.packager.wix]
+template = "packaging/wix/main.wxs"
+
 [workspace.lints.rust]
 warnings = "deny"
 future_incompatible = { level = "deny", priority = -1 }

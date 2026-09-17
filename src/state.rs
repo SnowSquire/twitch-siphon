@@ -28,6 +28,8 @@ pub enum UiIntent {
     RemoveChannel(u64),
     SetNotifyTitleChanges(bool),
     SetSound(bool),
+    AddFilteredWord(String),
+    RemoveFilteredWord(usize),
     ClearError,
 }
 
@@ -230,6 +232,16 @@ impl WorkState {
         Self::commit_save(work, Some(pending)).await;
     }
 
+    pub async fn apply_add_filtered_word(work: &Rc<RefCell<Self>>, word: String) {
+        let pending = work.borrow_mut().stage_add_filtered_word(&word);
+        Self::commit_save(work, pending).await;
+    }
+
+    pub async fn apply_remove_filtered_word(work: &Rc<RefCell<Self>>, index: usize) {
+        let pending = work.borrow_mut().stage_remove_filtered_word(index);
+        Self::commit_save(work, pending).await;
+    }
+
     fn stage_save(&mut self, forward: hermes::Command) -> PendingSave {
         Rc::make_mut(&mut self.config).version = Config::VERSION;
         PendingSave {
@@ -358,6 +370,42 @@ impl WorkState {
     fn stage_sound(&mut self, value: bool) -> PendingSave {
         Rc::make_mut(&mut self.config).sound = value;
         self.stage_save(hermes::Command::SetSound(value))
+    }
+
+    /// Synchronous in-memory half of [`Self::apply_add_filtered_word`]:
+    /// trims and dedupes (case-insensitive, matching the matcher's folding)
+    /// under one short borrow. Yields `None` when nothing changed, so empty
+    /// input and duplicates never touch disk or the session.
+    fn stage_add_filtered_word(&mut self, word: &str) -> Option<PendingSave> {
+        let word = word.trim();
+        if word.is_empty() {
+            return None;
+        }
+        let folded = word.to_lowercase();
+        if self
+            .config
+            .filtered_words
+            .iter()
+            .any(|existing| existing.to_lowercase() == folded)
+        {
+            return None;
+        }
+        let config = Rc::make_mut(&mut self.config);
+        config.filtered_words.push(word.to_owned());
+        let forward = hermes::Command::SetFilteredWords(config.filtered_words.clone());
+        Some(self.stage_save(forward))
+    }
+
+    /// Synchronous in-memory half of [`Self::apply_remove_filtered_word`].
+    /// Yields `None` when the index is out of range, so no disk touch happens.
+    fn stage_remove_filtered_word(&mut self, index: usize) -> Option<PendingSave> {
+        if index >= self.config.filtered_words.len() {
+            return None;
+        }
+        Rc::make_mut(&mut self.config).filtered_words.remove(index);
+        let forward =
+            hermes::Command::SetFilteredWords(self.config.filtered_words.clone());
+        Some(self.stage_save(forward))
     }
 
     fn forward(&self, command: hermes::Command) {

@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use crate::balesh::{NanoId, Rng, Topic};
 
 use crate::gql::{self, Game, User};
+use crate::matcher::Matcher;
 use crate::notifier;
 use crate::state::WorkState;
 
@@ -26,6 +27,7 @@ pub enum Command {
     RemoveChannel(u64),
     SetNotifyTitleChanges(bool),
     SetSound(bool),
+    SetFilteredWords(Vec<String>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,12 +74,31 @@ struct Preferences {
     sound: bool,
 }
 
+/// Folds `words` for the byte-exact matcher and builds it. Called once at
+/// startup and again on every filter change, so the live matcher always
+/// reflects the persisted list.
+fn build_matcher(words: &[String]) -> Matcher {
+    Matcher::new(
+        &words
+            .iter()
+            // An empty pattern matches everything; it can only come from
+            // a hand-edited config, so drop it rather than muting all.
+            .filter(|word| !word.is_empty())
+            .map(|word| word.to_lowercase())
+            .collect::<Vec<_>>(),
+    )
+}
+
 pub struct Session {
     work: Rc<RefCell<WorkState>>,
     command_rx: kanal::AsyncReceiver<Command>,
     channels: HashMap<u64, User>,
     subs: HashMap<Topic, Sub>,
     preferences: Preferences,
+    /// Substring filter for title-change toasts, built from
+    /// `filtered_words`. Patterns are folded at build time and titles at
+    /// check time, since the matcher itself is byte-exact.
+    matcher: Matcher,
     socket: Option<WsStream>,
     welcomed: bool,
     keepalive_secs: u64,
@@ -89,22 +110,18 @@ pub struct Session {
 
 impl Session {
     pub fn new(work: Rc<RefCell<WorkState>>, command_rx: kanal::AsyncReceiver<Command>) -> Self {
-        let (notify_title_changes, sound) = {
-            let work = work.borrow();
-            (
-                work.config_snapshot().notify_title_changes,
-                work.config_snapshot().sound,
-            )
-        };
+        let config = work.borrow().config_snapshot();
+        let matcher = build_matcher(&config.filtered_words);
         Self {
             work,
             command_rx,
             channels: HashMap::new(),
             subs: HashMap::new(),
             preferences: Preferences {
-                notify_title_changes,
-                sound,
+                notify_title_changes: config.notify_title_changes,
+                sound: config.sound,
             },
+            matcher,
 
             socket: None,
             welcomed: false,
@@ -192,6 +209,12 @@ impl Session {
         !self.channels.is_empty() || !self.work.borrow().config_snapshot().channels.is_empty()
     }
 
+    /// Whether `title` trips the word filter. Case-insensitive: patterns are
+    /// already folded, so the title folds here before matching.
+    fn title_filtered(&self, title: &str) -> bool {
+        self.matcher.is_match(&title.to_lowercase())
+    }
+
     /// Applies one ui mutation. Additions are subscribed on the live
     /// connection when there is one; removals are unsubscribed the same way.
     /// The socket itself is never restarted for config changes.
@@ -206,6 +229,10 @@ impl Session {
             Command::SetSound(value) => {
                 log::info!(target: "hermes", "sound={value}");
                 self.preferences.sound = value;
+            }
+            Command::SetFilteredWords(words) => {
+                log::info!(target: "hermes", "filtered_words={words:?}");
+                self.matcher = build_matcher(&words);
             }
         }
     }
@@ -607,13 +634,19 @@ impl Session {
             .filter(|game| !game.is_empty())
             .map(String::from);
         let old_game = pubsub["old_game"].as_str().unwrap_or_default();
+        // Whether the new title trips the word filter; only title changes
+        // are gated on it below.
+        let title_filtered = self.title_filtered(&status);
         let Some(user) = self.channels.get_mut(&channel_id) else {
             return;
         };
         let title_changed = user.stream_title.as_deref() != Some(status.as_str());
         let game_changed = game.as_deref() != user.game.as_ref().map(|game| game.name.as_str());
         let can_notify = self.preferences.notify_title_changes && !user.live;
-        if can_notify && (title_changed || game_changed) {
+        // Only title changes are filtered: a game-only update still notifies
+        // on a filtered title, while a retitle into one stays silent.
+        let filtered = title_changed && title_filtered;
+        if can_notify && (title_changed || game_changed) && !filtered {
             let mut lines = Vec::new();
             if title_changed {
                 lines.push(format!("{old_status} → {status}"));
@@ -773,5 +806,51 @@ impl Session {
             pending_adds: self.work.borrow().pending_adds.clone(),
         };
         self.work.borrow_mut().set_status(status);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::state::{GuiWaker, WorkContext, WorkState};
+
+    fn test_session(filtered_words: &[&str]) -> Session {
+        let config = Config {
+            filtered_words: filtered_words.iter().map(ToString::to_string).collect(),
+            ..Config::default()
+        };
+        let (_ui_tx, ui_rx) = kanal::unbounded();
+        let (frame_tx, _frame_rx) = kanal::unbounded();
+        let (tray_tx, _tray_rx) = kanal::unbounded();
+        let (_tray_event_tx, tray_events) = kanal::unbounded();
+        let (session_tx, command_rx) = kanal::unbounded();
+        let work = Rc::new(RefCell::new(WorkState::new(
+            WorkContext {
+                config_path: std::env::temp_dir().join("siphon-hermes-test.json"),
+                config,
+                ui_rx,
+                frame_tx,
+                tray_tx,
+                tray_events,
+                waker: GuiWaker::new(),
+            },
+            session_tx,
+        )));
+        Session::new(work, command_rx.to_async())
+    }
+
+    #[test]
+    fn title_filter_matches_case_insensitively() {
+        let session = test_session(&["offline"]);
+        assert!(session.title_filtered("going OFFLINE for the night"));
+        assert!(session.title_filtered("Offline"));
+        assert!(!session.title_filtered("online and grinding ranked"));
+    }
+
+    #[test]
+    fn title_filter_empty_word_list_matches_nothing() {
+        let session = test_session(&[]);
+        assert!(!session.title_filtered("offline"));
     }
 }

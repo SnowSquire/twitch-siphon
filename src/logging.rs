@@ -21,9 +21,17 @@ pub fn log_dir(app_id: &str) -> PathBuf {
 }
 
 /// Route `log` records to stderr and a capped rotating file. Failures fall
-/// back to stderr-only so logging never prevents startup. Returns the live
-/// log file path for the startup record.
-pub fn init(app_id: &str) -> PathBuf {
+/// back to stderr-only so logging never prevents startup. Debug builds log
+/// to stdout only and never touch disk. Returns the live log file path for
+/// the startup record, or `None` when there is no file.
+pub fn init(app_id: &str) -> Option<PathBuf> {
+    if cfg!(debug_assertions) {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .target(env_logger::Target::Stdout)
+            .try_init()
+            .ok();
+        return None;
+    }
     let stem = app_id.rsplit('.').next().unwrap_or(app_id);
     let dir = log_dir(app_id);
     let current = dir.join(format!("{stem}.log"));
@@ -48,7 +56,7 @@ pub fn init(app_id: &str) -> PathBuf {
                 .ok();
         }
     }
-    current
+    Some(current)
 }
 
 /// Fixed set of `stem.log` plus `stem.N.log` backups whose sizes sum to at

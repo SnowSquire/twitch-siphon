@@ -57,6 +57,10 @@ fn build_menu() -> Result<Menu, String> {
     Ok(menu)
 }
 
+#[cfg(debug_assertions)]
+const TOOLTIP: &str = "Siphon Dev";
+#[cfg(not(debug_assertions))]
+const TOOLTIP: &str = "Siphon";
 /// Builds the tray icon. On Windows/macOS this must run on the thread that
 /// owns an event loop (call from the `run_native` creator closure); the
 /// Linux `ksni` backend pumps D-Bus itself and has no thread affinity, but
@@ -64,7 +68,7 @@ fn build_menu() -> Result<Menu, String> {
 pub fn build() -> Result<Tray, String> {
     let icon = TrayIconBuilder::new()
         .with_id("main")
-        .with_tooltip("Siphon")
+        .with_tooltip(TOOLTIP)
         .with_icon(load_icon()?)
         .with_menu(Box::new(build_menu()?))
         .with_menu_on_left_click(false)

@@ -95,6 +95,12 @@ impl EventLoop {
             UiIntent::SetSound(value) => {
                 WorkState::apply_sound(&self.work, value).await;
             }
+            UiIntent::AddFilteredWord(word) => {
+                WorkState::apply_add_filtered_word(&self.work, word).await;
+            }
+            UiIntent::RemoveFilteredWord(index) => {
+                WorkState::apply_remove_filtered_word(&self.work, index).await;
+            }
             UiIntent::ClearError => self.work.borrow_mut().clear_error(),
         }
     }

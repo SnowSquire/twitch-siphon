@@ -8,6 +8,7 @@ mod event_loop;
 mod gql;
 mod hermes;
 mod logging;
+mod matcher;
 mod notifier;
 mod state;
 mod tray;
@@ -23,12 +24,19 @@ use crate::hermes::Session;
 use crate::state::{FrameState, GuiWaker, UiIntent, WorkContext, WorkState};
 use crate::tray::TrayAction;
 
-/// Single-instance key and config directory name.
+/// Single-instance key and config directory name. Debug builds use a
+/// separate id so a debug binary runs alongside the installed release
+/// without waking it or sharing its config.
+#[cfg(debug_assertions)]
+const APP_ID: &str = "com.iken.siphon.debug";
+#[cfg(not(debug_assertions))]
 const APP_ID: &str = "com.iken.siphon";
 
 fn main() {
-    let log_file = crate::logging::init(APP_ID);
-    log::info!(target: "app", "logging to {}", log_file.display());
+    match crate::logging::init(APP_ID) {
+        Some(path) => log::info!(target: "app", "logging to {}", path.display()),
+        None => log::info!(target: "app", "logging to stdout"),
+    }
 
     // A second launch wakes the first instance and exits immediately.
     if app_single_instance::notify_if_running(APP_ID) {
