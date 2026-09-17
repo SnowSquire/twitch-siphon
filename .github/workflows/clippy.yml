@@ -18,10 +18,18 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
 
       - name: install system dependencies
         run: sudo apt-get update && sudo apt-get install -y gcc pkg-config libgl-dev libegl-dev libwayland-dev libxkbcommon-dev
 
       # Workspace lints already deny warnings; plain clippy is enough.
-      - name: clippy
+      - name: clippy (linux)
         run: cargo clippy --all-targets --locked
+
+      # Check-only: clippy never links, so no MSVC toolchain needed.
+      - name: clippy (windows)
+        run: cargo clippy --all-targets --locked --target x86_64-pc-windows-msvc
