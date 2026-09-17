@@ -95,7 +95,7 @@ jobs:
         run: cargo packager --release --formats wix
 
       - name: upload Windows artifacts
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           files: |
@@ -133,7 +133,7 @@ jobs:
         run: cargo packager --release --formats appimage
 
       - name: upload Linux artifacts
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           files: target/release/*.AppImage
