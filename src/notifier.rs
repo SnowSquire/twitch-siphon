@@ -3,7 +3,7 @@ use notify_rust::{Notification, NotificationResponse, Timeout};
 #[cfg(target_os = "windows")]
 use tauri_winrt_notification::{Duration, Sound, Toast};
 
-use crate::gql;
+use crate::http;
 
 /// aumid the toasts are shown under; registered per-user on startup so the
 /// notification banner shows us instead of the powershell fallback
@@ -147,7 +147,7 @@ async fn resolve_image(image: Option<&str>) -> Option<String> {
     compio::fs::create_dir_all(&dir).await.ok()?;
     let path = dir.join(file_name);
     if compio::fs::metadata(&path).await.is_err()
-        && let Err(error) = gql::fetch_file(url, &path).await
+        && let Err(error) = http::fetch_file(url, &path).await
     {
         log::info!(target: "notifier", "failed to download avatar: {error}");
         return None;

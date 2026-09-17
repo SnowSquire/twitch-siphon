@@ -396,7 +396,7 @@ mod tests {
         block_on(async {
             let (port, serve) = serve_once(response).await;
             let url = format!("http://127.0.0.1:{port}/avatar.png");
-            let ((), result) = futures_util::join!(serve, super::fetch_file(&url, &path));
+            let ((), result) = futures_util::join!(serve, crate::http::fetch_file(&url, &path));
             result.unwrap();
         });
 
@@ -422,7 +422,7 @@ mod tests {
         block_on(async {
             let (port, serve) = serve_once(response).await;
             let url = format!("http://127.0.0.1:{port}/avatar.png");
-            let ((), result) = futures_util::join!(serve, super::fetch_file(&url, &path));
+            let ((), result) = futures_util::join!(serve, crate::http::fetch_file(&url, &path));
             assert!(result.is_err(), "truncated body should fail");
         });
 
@@ -440,7 +440,7 @@ mod tests {
         block_on(async {
             let (port, serve) = serve_once(response).await;
             let url = format!("http://127.0.0.1:{port}/avatar.png");
-            let ((), result) = futures_util::join!(serve, super::fetch_file(&url, &path));
+            let ((), result) = futures_util::join!(serve, crate::http::fetch_file(&url, &path));
             assert!(result.is_err(), "error status should fail");
         });
 

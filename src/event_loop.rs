@@ -11,11 +11,11 @@ use std::rc::Rc;
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt as _, StreamExt as _};
 
-use crate::gql;
+use crate::http;
 use crate::state::{UiIntent, WorkState};
 
 /// One finished channel resolve: the login plus the gql result.
-type ChannelResolveDone = (String, Result<Vec<gql::User>, gql::Error>);
+type ChannelResolveDone = (String, Result<Vec<http::User>, http::Error>);
 /// In-flight resolve future. `!Send` is fine: everything stays on this one
 /// thread-per-core runtime thread.
 type ChannelFuture = Pin<Box<dyn Future<Output = ChannelResolveDone>>>;
@@ -81,7 +81,7 @@ impl EventLoop {
             UiIntent::AddLogin(login) => {
                 if let Some(login) = self.work.borrow_mut().begin_add_login(&login) {
                     self.pending.push(Box::pin(async move {
-                        let users = gql::fetch_users(&[], std::slice::from_ref(&login)).await;
+                        let users = http::fetch_users(&[], std::slice::from_ref(&login)).await;
                         (login, users)
                     }));
                 }

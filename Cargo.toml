@@ -12,27 +12,20 @@ edition = "2024"
 [dependencies]
 # UI + tray + single-instance: the standalone `tray-icon` crate is the same
 # code Tauri wraps, usable without Tauri (see tray-icon/examples/egui.rs).
-# `wgpu` stays off for now: `gpu-allocator 0.28` caps `windows` at `<=0.62`
-# (excludes 0.62.2) while `wgpu-hal 30` wants `^0.62`, forking the `windows`
-# crate inside the DX12 backend and breaking the build. Only `glow` (OpenGL)
-# is needed until upstream fixes the bound or the Vulkan work starts.
+# `wgpu` renderer, Vulkan only: `wgpu_no_default_features` pulls the crates
+# with no backends, so the direct `wgpu` dep below is the sole backend
+# selector.
 eframe = { version = "0.36", default-features = false, features = [
   "accesskit",
   "default_fonts",
-  "glow",
   "links",
   "wayland",
+  "wgpu_no_default_features",
 ] }
 egui = "0.36"
 # Sync+async MPMC channels bridging the GUI thread and the work runtime.
 kanal = "0.1"
-# Only for `select!` over the `tray-icon` global receivers (which are
-# `crossbeam_channel` channels): one proxy thread blocking on both.
-# `ksni` backend on Linux (pure-Rust StatusNotifierItem over D-Bus) instead of
-# `libappindicator`: no GTK, no system tray dev-packages, no gtk event-loop
-# thread. `ksni` itself is enabled without its tokio default (async-io +
-# blocking only), keeping the tree tokio-free. No-op on Windows/macOS, where
-# the `ksni` optional dependency doesn't apply.
+# Only for `select!` over the `tray-icon` global receivers, lowkey want to drop both this and tray-icon
 crossbeam-channel = "0.5"
 tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
 app-single-instance = "0.1"
@@ -41,7 +34,6 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 dirs = "6"
 open = "5"
 env_logger = "0.11"
-notify-rust = { version = "4", features = ["async"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 compio = { version = "0.19", features = [
@@ -63,16 +55,27 @@ futures-util = { version = "0.3", default-features = false, features = [
   "async-await-macro",
 ] }
 log = "0.4"
+# Sole wgpu backend selector (see the eframe comment above).
+wgpu = { version = "30", default-features = false, features = [
+  "vulkan",
+  "vulkan-portability",
+] }
 
 
 [target."cfg(windows)".dependencies]
 winreg = "0.55"
-tauri-winrt-notification = "0.7"
+tauri-winrt-notification = "0.8"
 # Minimal Win32 surface for hide-to-tray (ShowWindow), per emilk/egui#737.
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_UI_WindowsAndMessaging",
 ] }
+
+# notify-rust only serves non-Windows toasts; keeping it out of the Windows
+# graph avoids its tauri-winrt-notification 0.7 chain pinning `windows` 0.61
+# while wgpu needs it unified on 0.62 (two copies break the DX12 backend).
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+notify-rust = { version = "4", features = ["async"] }
 
 
 [package.metadata.packager]

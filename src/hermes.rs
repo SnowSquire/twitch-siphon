@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::balesh::{NanoId, Rng, Topic};
 
-use crate::gql::{self, Game, User};
+use crate::http::{self, Game, User};
 use crate::matcher::Matcher;
 use crate::notifier;
 use crate::state::WorkState;
@@ -247,7 +247,7 @@ impl Session {
         }
         log::info!(target: "hermes", "channel {login} added");
         // One targeted fetch seeds the notify baseline (title/game/live).
-        match gql::fetch_users(&[], std::slice::from_ref(&login)).await {
+        match http::fetch_users(&[], std::slice::from_ref(&login)).await {
             Ok(mut users) => {
                 let user = users
                     .pop()
@@ -361,7 +361,7 @@ impl Session {
         if ids.is_empty() {
             return;
         }
-        match gql::fetch_users(ids, &[]).await {
+        match http::fetch_users(ids, &[]).await {
             Ok(users) => {
                 let mut seen = std::collections::HashSet::with_capacity(users.len());
                 for user in users {
@@ -716,7 +716,7 @@ impl Session {
                 } else {
                     false
                 };
-                match gql::fetch_users(&[channel_id], &[]).await {
+                match http::fetch_users(&[channel_id], &[]).await {
                     Ok(users) => {
                         let Some(mut user) =
                             users.into_iter().find(|user| user.channel_id == channel_id)

@@ -15,8 +15,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 use kanal::{Receiver, Sender};
 
 use crate::config::{Channel, Config};
-use crate::gql;
 use crate::hermes;
+use crate::http;
 use crate::tray::TrayAction;
 
 /// One imperative UI mutation. Sent GUI→work instead of diffing whole
@@ -175,7 +175,7 @@ impl WorkState {
     pub async fn finish_add_login(
         work: &Rc<RefCell<Self>>,
         login: String,
-        result: Result<Vec<gql::User>, gql::Error>,
+        result: Result<Vec<http::User>, http::Error>,
     ) {
         let pending = work.borrow_mut().stage_finish_add_login(&login, result);
         let finished_without_save = pending.is_none();
@@ -272,7 +272,7 @@ impl WorkState {
     fn stage_finish_add_login(
         &mut self,
         login: &str,
-        result: Result<Vec<gql::User>, gql::Error>,
+        result: Result<Vec<http::User>, http::Error>,
     ) -> Option<PendingSave> {
         match result {
             Ok(users) => {
@@ -403,8 +403,7 @@ impl WorkState {
             return None;
         }
         Rc::make_mut(&mut self.config).filtered_words.remove(index);
-        let forward =
-            hermes::Command::SetFilteredWords(self.config.filtered_words.clone());
+        let forward = hermes::Command::SetFilteredWords(self.config.filtered_words.clone());
         Some(self.stage_save(forward))
     }
 
@@ -526,7 +525,7 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("siphon-state-add-{}.json", std::process::id()));
         let (work, session_rx) = test_work(Config::default(), path.clone());
-        let user = gql::User {
+        let user = http::User {
             channel_id: 7,
             channel_name: "alice".to_owned(),
             channel_display_name: "Alice".to_owned(),

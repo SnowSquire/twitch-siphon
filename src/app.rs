@@ -268,122 +268,126 @@ impl SiphonApp {
 
             match *tab {
                 Tab::Channels => {
-                    // Right columns keep cached text widths so each row sums to the
-                    // available width. Rows are plain horizontal strips: every
-                    // position comes from current-frame sizes, so nothing lags a
-                    // resize by a frame.
-                    let row_height = ui.spacing().interact_size.y;
-                    let col_spacing = ui.spacing().item_spacing.x;
-                    let stripe = ui.visuals().faint_bg_color;
-                    let (live_width, title_width, remove_width) =
-                        self.col_widths.unwrap_or((80.0, 80.0, 32.0));
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            // Measured inside the scroll area so a visible scrollbar
-                            // is already subtracted from the available width.
-                            let name_width = (ui.available_width()
-                                - live_width
-                                - title_width
-                                - remove_width
-                                - col_spacing * 3.0)
-                                .max(40.0);
-                            // Header is row zero, which carries no stripe.
-                            table_row(ui, false, stripe, row_height, |ui| {
-                                ui.add_sized(
-                                    [name_width, row_height],
-                                    egui::Label::new("Channel")
-                                        .halign(egui::Align::LEFT)
-                                        .selectable(false),
-                                );
-                                ui.add_sized(
-                                    [live_width, row_height],
-                                    egui::Label::new("Live Status").selectable(false),
-                                );
-                                ui.add_sized(
-                                    [title_width, row_height],
-                                    egui::Label::new("Title Status").selectable(false),
-                                );
-                                ui.allocate_space(egui::vec2(remove_width, row_height));
-                            });
-                            let mut striped = true;
-                            for channel in &config.channels {
-                                let resolved = status.and_then(|snapshot| {
-                                    snapshot
-                                        .channels
-                                        .iter()
-                                        .find(|entry| entry.channel_id == channel.id)
-                                });
-                                let name = resolved
-                                    .map(|entry| entry.display_name.as_str())
-                                    .or(channel.display_name.as_deref())
-                                    .unwrap_or(channel.login.as_str());
-                                table_row(ui, striped, stripe, row_height, |ui| {
-                                    ui.add_sized(
-                                        [name_width, row_height],
-                                        egui::Label::new(name)
-                                            .halign(egui::Align::LEFT)
-                                            .selectable(false)
-                                            .truncate(),
-                                    );
-                                    sub_badge(
-                                        ui,
-                                        egui::vec2(live_width, row_height),
-                                        resolved
-                                            .map_or(SubStatus::Pending, |entry| entry.live_status),
-                                    );
-                                    sub_badge(
-                                        ui,
-                                        egui::vec2(title_width, row_height),
-                                        resolved
-                                            .map_or(SubStatus::Pending, |entry| entry.title_status),
-                                    );
-                                    let remove = ui.add_sized(
-                                        [remove_width, row_height],
-                                        egui::Button::new("×"),
-                                    );
-                                    // Formatted only while hovered: idle rows skip
-                                    // the allocation behind the tooltip.
-                                    let remove = if remove.hovered() {
-                                        remove.on_hover_text(format!("Remove {}", channel.login))
-                                    } else {
-                                        remove
-                                    };
-                                    if remove.clicked() {
-                                        let _ = ui_tx.send(UiIntent::RemoveChannel(channel.id));
-                                    }
-                                });
-                                striped = !striped;
-                            }
-                            for login in pending_adds {
-                                table_row(ui, striped, stripe, row_height, |ui| {
-                                    ui.add_sized(
-                                        [name_width, row_height],
-                                        egui::Label::new(login.as_str())
-                                            .halign(egui::Align::LEFT)
-                                            .selectable(false)
-                                            .truncate(),
-                                    );
-                                    sub_badge(
-                                        ui,
-                                        egui::vec2(live_width, row_height),
-                                        SubStatus::Pending,
-                                    );
-                                    sub_badge(
-                                        ui,
-                                        egui::vec2(title_width, row_height),
-                                        SubStatus::Pending,
-                                    );
-                                    ui.add_sized(
-                                        [remove_width, row_height],
-                                        egui::Label::new("…").selectable(false),
-                                    );
-                                });
-                                striped = !striped;
-                            }
-                        });
                     if config.channels.is_empty() && pending_adds.is_empty() {
                         ui.label("No channels configured. Add a streamer below.");
+                    } else {
+                        // Right columns keep cached text widths so each row sums to the
+                        // available width. Rows are plain horizontal strips: every
+                        // position comes from current-frame sizes, so nothing lags a
+                        // resize by a frame.
+                        let row_height = ui.spacing().interact_size.y;
+                        let col_spacing = ui.spacing().item_spacing.x;
+                        let stripe = ui.visuals().faint_bg_color;
+                        let (live_width, title_width, remove_width) =
+                            self.col_widths.unwrap_or((80.0, 80.0, 32.0));
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                // Measured inside the scroll area so a visible scrollbar
+                                // is already subtracted from the available width.
+                                let name_width = (ui.available_width()
+                                    - live_width
+                                    - title_width
+                                    - remove_width
+                                    - col_spacing * 3.0)
+                                    .max(40.0);
+                                // Header is row zero, which carries no stripe.
+                                table_row(ui, false, stripe, row_height, |ui| {
+                                    ui.add_sized(
+                                        [name_width, row_height],
+                                        egui::Label::new("Channel")
+                                            .halign(egui::Align::LEFT)
+                                            .selectable(false),
+                                    );
+                                    ui.add_sized(
+                                        [live_width, row_height],
+                                        egui::Label::new("Live Status").selectable(false),
+                                    );
+                                    ui.add_sized(
+                                        [title_width, row_height],
+                                        egui::Label::new("Title Status").selectable(false),
+                                    );
+                                    ui.allocate_space(egui::vec2(remove_width, row_height));
+                                });
+                                let mut striped = true;
+                                for channel in &config.channels {
+                                    let resolved = status.and_then(|snapshot| {
+                                        snapshot
+                                            .channels
+                                            .iter()
+                                            .find(|entry| entry.channel_id == channel.id)
+                                    });
+                                    let name = resolved
+                                        .map(|entry| entry.display_name.as_str())
+                                        .or(channel.display_name.as_deref())
+                                        .unwrap_or(channel.login.as_str());
+                                    table_row(ui, striped, stripe, row_height, |ui| {
+                                        ui.add_sized(
+                                            [name_width, row_height],
+                                            egui::Label::new(name)
+                                                .halign(egui::Align::LEFT)
+                                                .selectable(false)
+                                                .truncate(),
+                                        );
+                                        sub_badge(
+                                            ui,
+                                            egui::vec2(live_width, row_height),
+                                            resolved.map_or(SubStatus::Pending, |entry| {
+                                                entry.live_status
+                                            }),
+                                        );
+                                        sub_badge(
+                                            ui,
+                                            egui::vec2(title_width, row_height),
+                                            resolved.map_or(SubStatus::Pending, |entry| {
+                                                entry.title_status
+                                            }),
+                                        );
+                                        let remove = ui.add_sized(
+                                            [remove_width, row_height],
+                                            egui::Button::new("×"),
+                                        );
+                                        // Formatted only while hovered: idle rows skip
+                                        // the allocation behind the tooltip.
+                                        let remove = if remove.hovered() {
+                                            remove
+                                                .on_hover_text(format!("Remove {}", channel.login))
+                                        } else {
+                                            remove
+                                        };
+                                        if remove.clicked() {
+                                            let _ = ui_tx.send(UiIntent::RemoveChannel(channel.id));
+                                        }
+                                    });
+                                    striped = !striped;
+                                }
+                                for login in pending_adds {
+                                    table_row(ui, striped, stripe, row_height, |ui| {
+                                        ui.add_sized(
+                                            [name_width, row_height],
+                                            egui::Label::new(login.as_str())
+                                                .halign(egui::Align::LEFT)
+                                                .selectable(false)
+                                                .truncate(),
+                                        );
+                                        sub_badge(
+                                            ui,
+                                            egui::vec2(live_width, row_height),
+                                            SubStatus::Pending,
+                                        );
+                                        sub_badge(
+                                            ui,
+                                            egui::vec2(title_width, row_height),
+                                            SubStatus::Pending,
+                                        );
+                                        ui.add_sized(
+                                            [remove_width, row_height],
+                                            egui::Label::new("…").selectable(false),
+                                        );
+                                    });
+                                    striped = !striped;
+                                }
+                            });
                     }
                 }
                 Tab::FilteredWords => {
