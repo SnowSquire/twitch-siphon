@@ -67,8 +67,16 @@ jobs:
           name: windows-bin
           path: windows-bin
 
+      - name: cache cargo-packager
+        id: packager-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/cargo-packager.exe
+          key: cargo-packager-0.11.8-x86_64-pc-windows-msvc
+
       - name: install cargo-packager
-        run: cargo install cargo-packager --locked
+        if: steps.packager-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-packager --locked --version 0.11.8
 
       - name: stage binary for packager
         run: |
