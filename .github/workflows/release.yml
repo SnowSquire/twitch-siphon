@@ -103,6 +103,10 @@ jobs:
     # natively, but keep this set in case FUSE is unavailable.
     env:
       APPIMAGE_EXTRACT_AND_RUN: 1
+      # linuxdeploy ships an ancient strip that chokes on .relr.dyn
+      # (emitted by modern linkers); our binary is already stripped
+      # via Cargo, so skip deploy-time stripping entirely.
+      NO_STRIP: 1
       # The Actions environment forces CARGO_INCREMENTAL=0; re-enable it
       # since this runner keeps a persistent target/ dir.
       CARGO_INCREMENTAL: 1
