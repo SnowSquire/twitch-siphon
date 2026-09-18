@@ -8,7 +8,7 @@
 //! [`GuiWaker`], which is a doorbell, not state.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -18,6 +18,7 @@ use crate::config::{Channel, Config};
 use crate::hermes;
 use crate::http;
 use crate::tray::TrayAction;
+use crate::update;
 
 /// One imperative UI mutation. Sent GUI→work instead of diffing whole
 /// settings snapshots; the work thread persists, forwards to hermes, and
@@ -30,7 +31,31 @@ pub enum UiIntent {
     SetSound(bool),
     AddFilteredWord(String),
     RemoveFilteredWord(usize),
+    ApplyUpdate,
     ClearError,
+}
+
+/// Update offer shown in the top bar. The GUI renders it and sends
+/// [`UiIntent::ApplyUpdate`]; the work thread downloads and hands off to
+/// the installer. A click never fires from a toast.
+#[derive(Clone, Debug, Default)]
+pub enum UpdateStatus {
+    #[default]
+    Idle,
+    Checking,
+    Current,
+    Available(AvailableUpdate),
+    Downloading(AvailableUpdate),
+}
+
+/// A newer release: display version plus where to get it. `msi_url` is
+/// `None` on portable builds or when the release carries no installer,
+/// in which case the button opens `page_url` instead.
+#[derive(Clone, Debug)]
+pub struct AvailableUpdate {
+    pub version: String,
+    pub msi_url: Option<String>,
+    pub page_url: String,
 }
 
 /// Everything the GUI needs for one frame. Pushed work→GUI on every change;
@@ -41,6 +66,7 @@ pub struct FrameState {
     pub config: Config,
     pub status: Option<hermes::StatusSnapshot>,
     pub error: String,
+    pub update: UpdateStatus,
 }
 
 /// The single remaining shared primitive: a wake handle, not app state.
@@ -90,6 +116,7 @@ pub struct WorkState {
     config: Rc<Config>,
     error: String,
     status: Option<hermes::StatusSnapshot>,
+    update: UpdateStatus,
     session_tx: Sender<hermes::Command>,
     pub(crate) ui_rx: kanal::AsyncReceiver<UiIntent>,
     frame_tx: Sender<FrameState>,
@@ -112,6 +139,7 @@ impl WorkState {
             config: Rc::new(ctx.config),
             error: String::new(),
             status: None,
+            update: UpdateStatus::Idle,
             session_tx,
             ui_rx: ctx.ui_rx.to_async(),
             frame_tx: ctx.frame_tx,
@@ -240,6 +268,94 @@ impl WorkState {
     pub async fn apply_remove_filtered_word(work: &Rc<RefCell<Self>>, index: usize) {
         let pending = work.borrow_mut().stage_remove_filtered_word(index);
         Self::commit_save(work, pending).await;
+    }
+
+    /// Polls the latest release and offers it when newer. Skipped while a
+    /// check or download is already in flight. A failed check goes back to
+    /// idle silently (it retries on the next interval); only a
+    /// user-triggered download failure surfaces an error.
+    pub async fn check_for_update(work: &Rc<RefCell<Self>>) {
+        if matches!(
+            work.borrow().update,
+            UpdateStatus::Checking | UpdateStatus::Downloading(_)
+        ) {
+            return;
+        }
+        work.borrow_mut().update = UpdateStatus::Checking;
+        work.borrow().push_frame();
+        // No borrow held across the fetch: the result is applied below.
+        let result = update::fetch_latest().await;
+        let mut state = work.borrow_mut();
+        match result {
+            Ok(release) => {
+                state.update = if update::newer_than_current(&release) {
+                    log::info!(target: "update", "new release: {}", release.version);
+                    UpdateStatus::Available(AvailableUpdate {
+                        version: release.version.to_string(),
+                        msi_url: release.msi_url,
+                        page_url: release.page_url,
+                    })
+                } else {
+                    UpdateStatus::Current
+                };
+            }
+            Err(error) => {
+                log::info!(target: "update", "check failed: {error}");
+                state.update = UpdateStatus::Idle;
+            }
+        }
+        state.push_frame();
+    }
+
+    /// Starts applying the offered update. Yields the offer only from the
+    /// `Available` state, so double clicks and stale intents are ignored.
+    pub fn begin_update(&mut self) -> Option<AvailableUpdate> {
+        let info = match &self.update {
+            UpdateStatus::Available(info) => info.clone(),
+            _ => return None,
+        };
+        self.update = UpdateStatus::Downloading(info.clone());
+        self.push_frame();
+        Some(info)
+    }
+
+    /// Opens the release page for builds with no installer handoff
+    /// (portable builds, or a release without an installer asset). The
+    /// offer stays: the button remains until a newer check replaces it.
+    pub fn finish_update_page(&mut self, info: &AvailableUpdate) {
+        self.update = UpdateStatus::Available(info.clone());
+        if let Err(error) = open::that(&info.page_url) {
+            self.set_error(format!("couldn't open {}: {error}", info.page_url));
+        } else {
+            self.push_frame();
+        }
+    }
+
+    /// Applies a finished installer download: launches the updater and
+    /// quits so no files are locked; the updater reopens the app once the
+    /// install finishes. Failures revert to the offer with an error, so
+    /// the button retries.
+    pub fn finish_update_download(&mut self, result: Result<PathBuf, http::Error>) {
+        let info = match &self.update {
+            UpdateStatus::Downloading(info) => info.clone(),
+            _ => return,
+        };
+        match result {
+            Ok(path) => match launch_installer(&path) {
+                Ok(()) => {
+                    log::info!(target: "update", "updater launched, quitting for upgrade");
+                    self.forward_tray(TrayAction::Quit);
+                }
+                Err(error) => {
+                    self.update = UpdateStatus::Available(info);
+                    self.set_error(format!("couldn't launch installer: {error}"));
+                }
+            },
+            Err(error) => {
+                self.update = UpdateStatus::Available(info);
+                self.set_error(format!("update download failed: {error}"));
+            }
+        }
     }
 
     fn stage_save(&mut self, forward: hermes::Command) -> PendingSave {
@@ -425,6 +541,7 @@ impl WorkState {
             config: self.config.as_ref().clone(),
             status: self.status.clone(),
             error: self.error.clone(),
+            update: self.update.clone(),
         });
         self.wake();
     }
@@ -432,6 +549,18 @@ impl WorkState {
     fn wake(&self) {
         self.waker.repaint();
     }
+}
+
+/// Runs the downloaded package's installer, then reopens the app. Only
+/// MSI installs on Windows ever download, so other platforms reaching
+/// here is a bug, not a path.
+#[cfg(windows)]
+fn launch_installer(path: &Path) -> Result<(), http::Error> {
+    update::install_msi_and_relaunch(path)
+}
+#[cfg(not(windows))]
+fn launch_installer(_path: &Path) -> Result<(), http::Error> {
+    Err("no installer for this platform".into())
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@
 
 - eframe uses `wgpu` (Vulkan only) with `default-features = false`. Backend selection lives on the direct `wgpu` dep (`vulkan` + `vulkan-portability`); eframe's own `wgpu` feature pulls every backend (see `Cargo.toml` comment).
 - Config at `dirs::config_dir()/com.iken.siphon/config.json`, `VERSION = 1`: a file newer than `VERSION` is discarded (fresh default), unversioned files load as 0 and are stamped on next save. Only resolved channels persist — unknown logins surface an error and must not touch disk or reach the session.
-- Logging: `RUST_LOG=info|debug`, targets `app single config gql hermes notifier tray`. Release goes to stderr plus a capped rotating file (10 MB total, 5 files) under local app-data `com.iken.siphon/logs`; debug goes to stdout only and never touches disk.
+- Logging: `RUST_LOG=info|debug`, targets `app single config gql hermes notifier tray update`. Release goes to stderr plus a capped rotating file (10 MB total, 5 files) under local app-data `com.iken.siphon/logs`; debug goes to stdout only and never touches disk.
 - Single instance key `com.iken.siphon` (`com.iken.siphon.debug` in debug builds, which get a separate config dir too): a second launch wakes the primary via callback and exits.
 - Clippy allows that look like mistakes are deliberate: `cast_*` for tray math, `missing_panics_doc`/`missing_errors_doc`/`too_many_lines`/`missing_const_for_fn`.
 

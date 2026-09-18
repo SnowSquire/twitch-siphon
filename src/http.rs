@@ -16,7 +16,7 @@ const GQL_TIMEOUT: Duration = Duration::from_secs(15);
 // cyper's `Client` is thread-local (`!Send + !Sync`, backed by `Rc`), so it
 // cannot live in a shared static. Each compio runtime thread builds its own
 // (fetches here are infrequent: connect/add/stream-up, plus avatar downloads).
-fn client() -> Result<cyper::Client, Error> {
+pub(crate) fn client() -> Result<cyper::Client, Error> {
     Ok(cyper::Client::new()?)
 }
 

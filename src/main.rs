@@ -12,6 +12,7 @@ mod matcher;
 mod notifier;
 mod state;
 mod tray;
+mod update;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -21,7 +22,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use crate::config::Config;
 use crate::event_loop::EventLoop;
 use crate::hermes::Session;
-use crate::state::{FrameState, GuiWaker, UiIntent, WorkContext, WorkState};
+use crate::state::{FrameState, GuiWaker, UiIntent, UpdateStatus, WorkContext, WorkState};
 use crate::tray::TrayAction;
 
 /// Single-instance key and config directory name. Debug builds use a
@@ -74,6 +75,7 @@ fn main() {
         config: config.clone(),
         status: None,
         error: String::new(),
+        update: UpdateStatus::Idle,
     };
 
     //worker thread, runs hermes and event loop

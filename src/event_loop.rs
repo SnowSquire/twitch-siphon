@@ -1,10 +1,12 @@
-//! UI intent pump. Awaits UI intents, tray events, and channel resolve
+//! UI intent pump. Awaits UI intents, tray events, and background job
 //! completions; the runtime otherwise sleeps. Intent handling is
-//! synchronous; resolves wait in a `FuturesUnordered` polled by this same
-//! routine, so no task is ever spawned.
+//! synchronous; channel resolves and update jobs wait in one
+//! `FuturesUnordered` polled by this same routine, so no task is ever
+//! spawned.
 
 use std::cell::RefCell;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
 
@@ -13,65 +15,100 @@ use futures_util::{FutureExt as _, StreamExt as _};
 
 use crate::http;
 use crate::state::{UiIntent, WorkState};
+use crate::update;
 
-/// One finished channel resolve: the login plus the gql result.
-type ChannelResolveDone = (String, Result<Vec<http::User>, http::Error>);
-/// In-flight resolve future. `!Send` is fine: everything stays on this one
+/// One finished background job: a channel resolve or an update step.
+/// Both kinds share the queue; completions dispatch in [`EventLoop::handle_job`].
+enum JobDone {
+    ChannelResolved(String, Result<Vec<http::User>, http::Error>),
+    UpdateCheckFinished,
+    UpdateCheckDue,
+    UpdateDownloadFinished(Result<PathBuf, http::Error>),
+}
+/// One in-flight job. `!Send` is fine: everything stays on this one
 /// thread-per-core runtime thread.
-type ChannelFuture = Pin<Box<dyn Future<Output = ChannelResolveDone>>>;
+type JobFuture = Pin<Box<dyn Future<Output = JobDone>>>;
 
 pub struct EventLoop {
     work: Rc<RefCell<WorkState>>,
-    pending: FuturesUnordered<ChannelFuture>,
+    jobs: FuturesUnordered<JobFuture>,
 }
 
 impl EventLoop {
     pub fn new(work: Rc<RefCell<WorkState>>) -> Self {
-        Self {
-            work,
-            pending: FuturesUnordered::new(),
-        }
+        let this = Self {
+            work: Rc::clone(&work),
+            jobs: FuturesUnordered::new(),
+        };
+        // Check immediately at startup; completions re-arm the interval.
+        this.push_update_check();
+        this
+    }
+
+    /// Queues one release check.
+    fn push_update_check(&self) {
+        let work = Rc::clone(&self.work);
+        self.jobs.push(Box::pin(async move {
+            WorkState::check_for_update(&work).await;
+            JobDone::UpdateCheckFinished
+        }));
+    }
+
+    /// Queues the wait after a check; expiry queues the next check.
+    fn push_update_wait(&self) {
+        self.jobs.push(Box::pin(async move {
+            compio::time::sleep(update::CHECK_INTERVAL).await;
+            JobDone::UpdateCheckDue
+        }));
     }
 
     pub async fn run(&mut self) {
         let ui_rx = self.work.borrow().ui_rx.clone();
         let tray_rx = self.work.borrow().tray_events.clone();
         loop {
-            if self.pending.is_empty() {
-                futures_util::select! {
-                    intent = ui_rx.recv().fuse() => {
-                        match intent {
-                            Ok(intent) => self.handle_intent(intent).await,
-                            Err(_) => break,
-                        }
-                    }
-                    action = tray_rx.recv().fuse() => {
-                        match action {
-                            Ok(action) => self.work.borrow().forward_tray(action),
-                            Err(_) => break,
-                        }
+            futures_util::select! {
+                intent = ui_rx.recv().fuse() => {
+                    match intent {
+                        Ok(intent) => self.handle_intent(intent).await,
+                        Err(_) => break,
                     }
                 }
-            } else {
-                futures_util::select! {
-                    intent = ui_rx.recv().fuse() => {
-                        match intent {
-                            Ok(intent) => self.handle_intent(intent).await,
-                            Err(_) => break,
-                        }
-                    }
-                    action = tray_rx.recv().fuse() => {
-                        match action {
-                            Ok(action) => self.work.borrow().forward_tray(action),
-                            Err(_) => break,
-                        }
-                    }
-                    done = self.pending.next().fuse() => {
-                        if let Some((login, result)) = done {
-                            WorkState::finish_add_login(&self.work, login, result).await;
-                        }
+                action = tray_rx.recv().fuse() => {
+                    match action {
+                        Ok(action) => self.work.borrow().forward_tray(action),
+                        Err(_) => break,
                     }
                 }
+                done = self.next_job().fuse() => {
+                    if let Some(done) = done {
+                        self.handle_job(done).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Next queued job completion. An empty queue resolves immediately,
+    /// which would busy-loop the `select!` above, so the empty case pends
+    /// instead until a job is queued.
+    async fn next_job(&mut self) -> Option<JobDone> {
+        if self.jobs.is_empty() {
+            std::future::pending::<()>().await;
+            None
+        } else {
+            self.jobs.next().await
+        }
+    }
+
+    async fn handle_job(&self, done: JobDone) {
+        match done {
+            JobDone::ChannelResolved(login, result) => {
+                WorkState::finish_add_login(&self.work, login, result).await;
+            }
+            JobDone::UpdateCheckFinished => self.push_update_wait(),
+            JobDone::UpdateCheckDue => self.push_update_check(),
+            JobDone::UpdateDownloadFinished(result) => {
+                self.work.borrow_mut().finish_update_download(result);
             }
         }
     }
@@ -80,9 +117,9 @@ impl EventLoop {
         match intent {
             UiIntent::AddLogin(login) => {
                 if let Some(login) = self.work.borrow_mut().begin_add_login(&login) {
-                    self.pending.push(Box::pin(async move {
+                    self.jobs.push(Box::pin(async move {
                         let users = http::fetch_users(&[], std::slice::from_ref(&login)).await;
-                        (login, users)
+                        JobDone::ChannelResolved(login, users)
                     }));
                 }
             }
@@ -100,6 +137,25 @@ impl EventLoop {
             }
             UiIntent::RemoveFilteredWord(index) => {
                 WorkState::apply_remove_filtered_word(&self.work, index).await;
+            }
+            UiIntent::ApplyUpdate => {
+                let Some(offer) = self.work.borrow_mut().begin_update() else {
+                    return;
+                };
+                // MSI installs download the installer; everything else
+                // opens the release page right away, keeping the offer.
+                let msi = matches!(update::install_mode(), update::InstallMode::Msi)
+                    .then(|| offer.msi_url.clone())
+                    .flatten();
+
+                if let Some(url) = msi {
+                    let version = offer.version.clone();
+                    self.jobs.push(Box::pin(async move {
+                        JobDone::UpdateDownloadFinished(update::download_msi(&url, &version).await)
+                    }));
+                } else {
+                    self.work.borrow_mut().finish_update_page(&offer);
+                }
             }
             UiIntent::ClearError => self.work.borrow_mut().clear_error(),
         }

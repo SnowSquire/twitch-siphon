@@ -118,6 +118,14 @@ jobs:
         # WiX 3.11 toolchain is auto-downloaded by cargo-packager.
         run: cargo packager --release --formats wix
 
+      - name: drop language suffix from MSI name
+        # cargo-packager appends the WiX language (siphon_0.1.3_x64_en-US.msi);
+        # normies get Siphon_<version>_x64.msi, matching the portable exe.
+        # The updater matches assets by .msi suffix, so it is unaffected.
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches.Groups[1].Value
+          Move-Item target/release/*.msi "target/release/Siphon_${version}_x64.msi"
+
       - name: upload Windows artifacts
         uses: softprops/action-gh-release@v3
         with:

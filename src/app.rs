@@ -8,7 +8,7 @@ use windows_sys::Win32::{Foundation::HWND, UI::WindowsAndMessaging as wam};
 use kanal::{Receiver, Sender};
 
 use crate::hermes::{StatusSnapshot, SubStatus};
-use crate::state::{FrameState, UiIntent};
+use crate::state::{FrameState, UiIntent, UpdateStatus};
 use crate::tray::{Tray, TrayAction};
 
 const GREEN: egui::Color32 = egui::Color32::from_rgb(46, 160, 67);
@@ -242,7 +242,10 @@ impl SiphonApp {
             }
 
             if !error.is_empty() {
-                ui.horizontal(|ui| {
+                // Wrapped, not horizontal: long errors (download failures
+                // carry urls and statuses) must wrap instead of running
+                // off-screen, with the dismiss button flowing inline.
+                ui.horizontal_wrapped(|ui| {
                     ui.colored_label(RED, error);
                     if ui.button("×").on_hover_text("Dismiss").clicked() {
                         let _ = ui_tx.send(UiIntent::ClearError);
@@ -254,10 +257,33 @@ impl SiphonApp {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("Siphon");
+                // Chrome, not content: never selectable, so clicks and
+                // drags around the button never start a text selection.
+                ui.add(
+                    egui::Label::new(egui::RichText::new("Siphon").heading()).selectable(false),
+                )
+                .on_hover_text(concat!("Siphon ", env!("CARGO_PKG_VERSION")));
+                // The only upgrade path: toast clicks never install.
+                match &frame.update {
+                    UpdateStatus::Available(offer) => {
+                        if ui
+                            .button(format!("Update to {}", offer.version))
+                            .on_hover_text("Download, install, and reopen")
+                            .clicked()
+                        {
+                            let _ = ui_tx.send(UiIntent::ApplyUpdate);
+                        }
+                    }
+                    UpdateStatus::Downloading(_) => {
+                        ui.add_enabled(false, egui::Button::new("Updating…"));
+                    }
+                    UpdateStatus::Idle | UpdateStatus::Checking | UpdateStatus::Current => {}
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (text, color) = connection_text(status);
-                    ui.colored_label(color, text);
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(text).color(color)).selectable(false),
+                    );
                 });
             });
             ui.horizontal(|ui| {
@@ -326,7 +352,7 @@ impl SiphonApp {
                                             [name_width, row_height],
                                             egui::Label::new(name)
                                                 .halign(egui::Align::LEFT)
-                                                .selectable(false)
+                                                .selectable(true)
                                                 .truncate(),
                                         );
                                         sub_badge(
@@ -367,7 +393,7 @@ impl SiphonApp {
                                             [name_width, row_height],
                                             egui::Label::new(login.as_str())
                                                 .halign(egui::Align::LEFT)
-                                                .selectable(false)
+                                                .selectable(true)
                                                 .truncate(),
                                         );
                                         sub_badge(

@@ -4159,6 +4159,7 @@ dependencies = [
  "notify-rust",
  "open",
  "raw-window-handle",
+ "semver",
  "serde",
  "serde_json",
  "tauri-winrt-notification 0.8.1",
