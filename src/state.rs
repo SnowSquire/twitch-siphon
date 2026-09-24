@@ -3,13 +3,14 @@
 //! The GUI thread is purely presentational: it renders the latest
 //! [`FrameState`] and sends [`UiIntent`]s. The work thread owns everything
 //! else (config, persistence, the hermes session) inside [`WorkState`], which
-//! lives on that single thread — no `Arc`, no `Mutex` for app state. The only
-//! cross-thread primitives are the [`kanal`] queues below plus
-//! [`GuiWaker`], which is a doorbell, not state.
+//! lives on that single thread. The GUI observes the latest snapshot through
+//! [`SharedFrame`]; the cross-thread primitives are the [`kanal`] queues
+//! below, that slot, and [`GuiWaker`], which is a doorbell, not state.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use kanal::{Receiver, Sender};
@@ -58,15 +59,64 @@ pub struct AvailableUpdate {
     pub page_url: String,
 }
 
-/// Everything the GUI needs for one frame. Pushed work→GUI on every change;
-/// the GUI keeps the latest and renders it. All fields are `Clone` so the
-/// snapshot crosses the channel by value.
+/// Everything the GUI needs for one frame. Overwritten work→GUI on every
+/// change; the GUI copies it out when its seen version lags. All fields are
+/// `Clone` so the snapshot crosses the slot by value.
 #[derive(Clone, Default)]
 pub struct FrameState {
     pub config: Config,
     pub status: Option<hermes::StatusSnapshot>,
     pub error: String,
     pub update: UpdateStatus,
+}
+
+/// Latest-only work→GUI snapshot slot. The work thread overwrites it on
+/// every change and pokes [`GuiWaker`]; the GUI thread copies it out when
+/// its seen version lags. Intermediate states vanish instead of queueing,
+/// so a stalled GUI never builds backlog.
+#[derive(Clone, Default)]
+pub struct SharedFrame {
+    inner: Arc<RwLock<FrameState>>,
+    version: Arc<AtomicU64>,
+}
+
+impl SharedFrame {
+    pub fn new(frame: FrameState) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(frame)),
+            version: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Overwrites the slot and marks it newer. A poisoned lock still takes
+    /// the write; the snapshot matters more than the panic that poisoned it.
+    pub fn store(&self, frame: FrameState) {
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = frame;
+        self.version.fetch_add(1, Ordering::Release);
+    }
+
+    /// Copies the whole snapshot plus its version.
+    pub fn load(&self) -> (FrameState, u64) {
+        let frame = self
+            .inner
+            .read()
+            .map(|slot| slot.clone())
+            .unwrap_or_else(|poison| poison.into_inner().clone());
+        (frame, self.version.load(Ordering::Acquire))
+    }
+
+    /// Copies the snapshot only when it is newer than `seen`, so idle
+    /// passes skip the clone. A store racing the check surfaces on the
+    /// next pass via the waker poke that accompanies every store.
+    pub fn load_newer(&self, seen: u64) -> Option<(FrameState, u64)> {
+        if self.version.load(Ordering::Acquire) == seen {
+            return None;
+        }
+        Some(self.load())
+    }
 }
 
 /// The single remaining shared primitive: a wake handle, not app state.
@@ -95,13 +145,14 @@ impl GuiWaker {
     }
 }
 
-/// Everything the work thread needs at startup. Moved in whole; the
-/// receivers/ends are then owned by the runtime tasks.
+/// Everything the work thread needs at startup. Moved in whole; the channel
+/// ends are then owned by the runtime tasks, the snapshot slot is shared
+/// with the GUI thread.
 pub struct WorkContext {
     pub config_path: PathBuf,
     pub config: Config,
     pub ui_rx: Receiver<UiIntent>,
-    pub frame_tx: Sender<FrameState>,
+    pub frame: SharedFrame,
     pub tray_tx: Sender<TrayAction>,
     pub tray_events: Receiver<TrayAction>,
     pub waker: GuiWaker,
@@ -119,7 +170,7 @@ pub struct WorkState {
     update: UpdateStatus,
     session_tx: Sender<hermes::Command>,
     pub(crate) ui_rx: kanal::AsyncReceiver<UiIntent>,
-    frame_tx: Sender<FrameState>,
+    frame: SharedFrame,
     tray_tx: Sender<TrayAction>,
     pub(crate) tray_events: kanal::AsyncReceiver<TrayAction>,
     waker: GuiWaker,
@@ -142,7 +193,7 @@ impl WorkState {
             update: UpdateStatus::Idle,
             session_tx,
             ui_rx: ctx.ui_rx.to_async(),
-            frame_tx: ctx.frame_tx,
+            frame: ctx.frame,
             tray_tx: ctx.tray_tx,
             tray_events: ctx.tray_events.to_async(),
             pending_adds: Arc::new(RwLock::new(Vec::new())),
@@ -537,7 +588,7 @@ impl WorkState {
     }
 
     pub fn push_frame(&self) {
-        let _ = self.frame_tx.send(FrameState {
+        self.frame.store(FrameState {
             config: self.config.as_ref().clone(),
             status: self.status.clone(),
             error: self.error.clone(),
@@ -573,7 +624,6 @@ mod tests {
         path: PathBuf,
     ) -> (Rc<RefCell<WorkState>>, Receiver<hermes::Command>) {
         let (_ui_tx, ui_rx) = kanal::unbounded();
-        let (frame_tx, _frame_rx) = kanal::unbounded();
         let (tray_tx, _tray_rx) = kanal::unbounded();
         let (_tray_event_tx, tray_events) = kanal::unbounded();
         let (session_tx, session_rx) = kanal::unbounded();
@@ -582,7 +632,7 @@ mod tests {
                 config_path: path,
                 config,
                 ui_rx,
-                frame_tx,
+                frame: SharedFrame::new(FrameState::default()),
                 tray_tx,
                 tray_events,
                 waker: GuiWaker::new(),
@@ -687,7 +737,7 @@ mod tests {
     fn finish_add_login_surfaces_error_without_touching_disk() {
         let path =
             std::env::temp_dir().join(format!("siphon-state-typo-{}.json", std::process::id()));
-        let (frame_tx, frame_rx) = kanal::unbounded();
+        let shared = SharedFrame::new(FrameState::default());
         let (tray_tx, _tray_rx) = kanal::unbounded();
         let (_ui_tx, ui_rx) = kanal::unbounded();
         let (_tray_event_tx, tray_events) = kanal::unbounded();
@@ -697,7 +747,7 @@ mod tests {
                 config_path: path.clone(),
                 config: Config::default(),
                 ui_rx,
-                frame_tx,
+                frame: shared.clone(),
                 tray_tx,
                 tray_events,
                 waker: GuiWaker::new(),
@@ -717,10 +767,7 @@ mod tests {
                 session_rx.is_empty(),
                 "unresolvable logins must not reach the session"
             );
-            let frame = frame_rx
-                .try_recv()
-                .expect("channel open")
-                .expect("error frame pushed");
+            let (frame, _) = shared.load_newer(0).expect("error frame pushed");
             assert!(
                 !frame.error.is_empty(),
                 "unresolvable logins must surface an error"
@@ -736,7 +783,7 @@ mod tests {
             channels: vec![channel("alice", 1), channel("bob", 2)],
             ..Config::default()
         };
-        let (frame_tx, frame_rx) = kanal::unbounded();
+        let shared = SharedFrame::new(FrameState::default());
         let (tray_tx, _tray_rx) = kanal::unbounded();
         let (_ui_tx, ui_rx) = kanal::unbounded();
         let (_tray_event_tx, tray_events) = kanal::unbounded();
@@ -746,7 +793,7 @@ mod tests {
                 config_path: path.clone(),
                 config,
                 ui_rx,
-                frame_tx,
+                frame: shared.clone(),
                 tray_tx,
                 tray_events,
                 waker: GuiWaker::new(),
@@ -769,11 +816,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 ["bob"]
             );
-            let mut last = None;
-            while let Ok(Some(frame)) = frame_rx.try_recv() {
-                last = Some(frame);
-            }
-            let frame = last.expect("frame pushed");
+            let (frame, _) = shared.load_newer(0).expect("frame pushed");
             assert_eq!(frame.config.channels.len(), 1);
             assert!(
                 !frame.error.is_empty(),

@@ -17,12 +17,16 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use eframe::egui_wgpu;
+#[cfg(windows)]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::config::Config;
 use crate::event_loop::EventLoop;
 use crate::hermes::Session;
-use crate::state::{FrameState, GuiWaker, UiIntent, UpdateStatus, WorkContext, WorkState};
+use crate::state::{
+    FrameState, GuiWaker, SharedFrame, UiIntent, UpdateStatus, WorkContext, WorkState,
+};
 use crate::tray::TrayAction;
 
 /// Single-instance key and config directory name. Debug builds use a
@@ -67,19 +71,21 @@ fn main() {
     );
 
     let (ui_tx, ui_rx) = kanal::unbounded::<UiIntent>();
-    let (frame_tx, frame_rx) = kanal::unbounded::<FrameState>();
     let (tray_tx, tray_rx) = kanal::unbounded::<TrayAction>();
     let tray_events = tray::spawn_proxy();
     let waker = GuiWaker::new();
-    let initial = FrameState {
+    // Latest-only snapshot slot shared by the work thread (writer) and the
+    // GUI thread (reader); the waker poke beside every store wakes the GUI.
+    let frame = SharedFrame::new(FrameState {
         config: config.clone(),
         status: None,
         error: String::new(),
         update: UpdateStatus::Idle,
-    };
+    });
 
     //worker thread, runs hermes and event loop
     let work_waker = waker.clone();
+    let work_frame = frame.clone();
     let _work_thread = std::thread::Builder::new()
         .name("worker thread".to_owned())
         .spawn(move || {
@@ -93,7 +99,7 @@ fn main() {
                                 config_path,
                                 config,
                                 ui_rx,
-                                frame_tx,
+                                frame: work_frame,
                                 tray_tx,
                                 tray_events,
                                 waker: work_waker,
@@ -134,23 +140,35 @@ fn main() {
         Err(error) => log::info!(target: "app", "window icon unavailable: {error}"),
     }
 
-    let options = eframe::NativeOptions {
-        viewport,
-        ..Default::default()
-    };
+    // Non-blocking presents. The Fifo/AutoVsync path stalls on the Windows
+    // flip path during a resize storm: the GUI thread keeps running but the
+    // compositor stops showing new frames, freezing the window. Mailbox is
+    // non-blocking like Immediate but paced to the display and tear-free.
+    // One frame in flight keeps the backlog bounded.
 
     let run_result = eframe::run_native(
         "Siphon",
-        options,
+        eframe::NativeOptions {
+            viewport,
+            wgpu_options: egui_wgpu::WgpuConfiguration {
+                surface: eframe::SurfaceConfig {
+                    present_mode: wgpu::PresentMode::Mailbox,
+                    desired_maximum_frame_latency: Some(1),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
         Box::new(move |cc| {
+            #[cfg(windows)]
             let hwnd = cc
                 .window_handle()
                 .ok()
                 .and_then(|handle| match handle.as_raw() {
                     RawWindowHandle::Win32(window) => Some(window.hwnd.get()),
                     _ => None,
-                });
-            log::info!(target: "app", "creator closure running, hwnd={hwnd:?}");
+                })
+                .ok_or("missing Win32 window handle")?;
             let tray = match tray::build() {
                 Ok(tray) => Some(tray),
                 Err(error) => {
@@ -159,9 +177,12 @@ fn main() {
                 }
             };
             waker.set(cc.egui_ctx.clone());
-            Ok(Box::new(app::SiphonApp::new(
-                ui_tx, frame_rx, tray_rx, initial, tray, single, hwnd,
-            )) as Box<dyn eframe::App>)
+            #[cfg(windows)]
+            let app = app::SiphonApp::new(ui_tx, frame, tray_rx, tray, single, hwnd);
+            #[cfg(not(windows))]
+            let app = app::SiphonApp::new(ui_tx, frame, tray_rx, tray, single);
+
+            Ok(Box::new(app) as Box<dyn eframe::App>)
         }),
     );
     if let Err(error) = run_result {

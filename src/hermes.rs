@@ -813,7 +813,7 @@ impl Session {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::state::{GuiWaker, WorkContext, WorkState};
+    use crate::state::{GuiWaker, SharedFrame, WorkContext, WorkState};
 
     fn test_session(filtered_words: &[&str]) -> Session {
         let config = Config {
@@ -821,7 +821,6 @@ mod tests {
             ..Config::default()
         };
         let (_ui_tx, ui_rx) = kanal::unbounded();
-        let (frame_tx, _frame_rx) = kanal::unbounded();
         let (tray_tx, _tray_rx) = kanal::unbounded();
         let (_tray_event_tx, tray_events) = kanal::unbounded();
         let (session_tx, command_rx) = kanal::unbounded();
@@ -830,7 +829,7 @@ mod tests {
                 config_path: std::env::temp_dir().join("siphon-hermes-test.json"),
                 config,
                 ui_rx,
-                frame_tx,
+                frame: SharedFrame::default(),
                 tray_tx,
                 tray_events,
                 waker: GuiWaker::new(),

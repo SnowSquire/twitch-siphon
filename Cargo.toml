@@ -132,6 +132,6 @@ cast_possible_wrap = "allow"
 missing_panics_doc = "allow"
 
 [profile.release]
-lto = false
+lto = true
 codegen-units = 1
 strip = true
