@@ -1,15 +1,4 @@
-//! wgpui presenter for Siphon.
-//!
-//! One root view owns a snapshot of the latest [`FrameState`] plus the two
-//! input fields. A foreground pump folds work→GUI events into it; every
-//! mutation goes work-ward as a [`UiIntent`]. Closing the
-//! window hides to the tray instead of quitting.
-
 use kanal::Sender;
-#[cfg(not(windows))]
-use wgpui::AnyWindowHandle;
-#[cfg(not(windows))]
-use wgpui::BorrowAppContext as _;
 use wgpui::{
     App, AsyncApp, Context, Entity, Render, Subscription, Window, div, prelude::*, px, rgb,
 };
@@ -62,12 +51,6 @@ pub struct SiphonView {
     /// Held alive for the app lifetime; the guard keeps this instance
     /// primary, so a second launch wakes it instead of starting over.
     _single: app_single_instance::PrimaryHandle,
-    /// Window handle for platforms without a Win32 `HWND`: tray Show
-    /// restores a minimized window through it. Windows hides through
-    /// `hwnd` instead, so this only exists elsewhere.
-    #[cfg(not(windows))]
-    window: AnyWindowHandle,
-    #[cfg(windows)]
     hwnd: Option<isize>,
     _subs: Vec<Subscription>,
 }
@@ -79,7 +62,6 @@ impl SiphonView {
         let login_input = cx.new(|cx| InputState::new(window, cx).placeholder("Add new streamer"));
         let word_input = cx.new(|cx| InputState::new(window, cx).placeholder("Add filtered word"));
         let (frame, seen_version) = params.shared.load();
-        #[cfg(windows)]
         let hwnd = win_hwnd(window);
         let view = cx.new(|_cx| SiphonView {
             ui_tx: params.ui_tx,
@@ -91,9 +73,6 @@ impl SiphonView {
             tab: Tab::Channels,
             tray: params.tray,
             _single: params.single,
-            #[cfg(not(windows))]
-            window: window.window_handle(),
-            #[cfg(windows)]
             hwnd,
             _subs: Vec::new(),
         });
@@ -119,9 +98,8 @@ impl SiphonView {
         }
 
         spawn_pump(cx, &view, params.gui_rx);
-        sync_theme(window, cx, &view);
+        sync_theme(window, cx);
 
-        #[cfg(windows)]
         let close_hwnd = view.read(cx).hwnd;
         let has_tray = view.read(cx).tray.is_some();
         window.on_window_should_close(cx, move |_window, cx| {
@@ -132,13 +110,10 @@ impl SiphonView {
                 cx.quit();
                 return true;
             }
-            #[cfg(windows)]
             if let Some(hwnd) = close_hwnd {
                 hide_window(hwnd);
                 log::info!(target: "tray", "close hid to tray");
             }
-            #[cfg(not(windows))]
-            _window.minimize_window();
             false
         });
 
@@ -147,28 +122,16 @@ impl SiphonView {
 }
 
 /// Applies the OS light/dark setting once. Later changes arrive as theme
-/// events from the system watcher on Windows, through window appearance
-/// elsewhere. Kit components render from the global theme, so a change
-/// repaints the whole tree without touching view state.
-fn sync_theme(window: &mut Window, cx: &mut App, _view: &Entity<SiphonView>) {
+/// events from the system watcher. Kit components render from the global
+/// theme, so a change repaints the whole tree without touching view state.
+fn sync_theme(window: &mut Window, cx: &mut App) {
     apply_system_theme(window, cx);
-    #[cfg(not(windows))]
-    {
-        let sub = window.observe_window_appearance(|window, cx| {
-            apply_system_theme(window, cx);
-        });
-        _view.update(cx, |view, _cx| view._subs.push(sub));
-    }
 }
 
 fn apply_system_theme(window: &mut Window, cx: &mut App) {
-    #[cfg(windows)]
     let mode = windows_registry_mode().unwrap_or_else(|| ThemeMode::from(window.appearance()));
-    #[cfg(not(windows))]
-    let mode = ThemeMode::from(window.appearance());
     log::info!(target: "app", "applying {} theme", mode.name());
     Theme::change(mode, Some(window), cx);
-    #[cfg(windows)]
     if let Some(hwnd) = win_hwnd(window) {
         {
             use windows_sys::Win32::Foundation::HWND;
@@ -192,7 +155,6 @@ fn apply_system_theme(window: &mut Window, cx: &mut App) {
 }
 
 /// The "default app mode" setting: 0 is dark, anything else is light.
-#[cfg(windows)]
 fn windows_registry_mode() -> Option<ThemeMode> {
     winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
         .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
@@ -212,7 +174,6 @@ fn windows_registry_mode() -> Option<ThemeMode> {
 /// clipboard apartment. The callback reads the reported mode and forwards
 /// it through the existing gui sender; the pump applies it directly, so
 /// there is no new channel, no new task, and no polling.
-#[cfg(windows)]
 pub fn watch_system_theme(gui: GuiSender) {
     use windows::Foundation::TypedEventHandler;
     use windows::UI::ViewManagement::UISettings;
@@ -317,20 +278,9 @@ fn handle_tray(
     match action {
         TrayAction::Show => {
             log::info!(target: "tray", "tray Open, showing window");
-            #[cfg(windows)]
-            {
-                let hwnd = weak.update(cx, |view, _cx| view.hwnd)?;
-                if let Some(hwnd) = hwnd {
-                    show_window(hwnd);
-                }
-            }
-            #[cfg(not(windows))]
-            {
-                let window = weak.update(cx, |view, _cx| view.window)?;
-                cx.update_window(window, |_, window, _| {
-                    window.activate_window();
-                })
-                .ok();
+            let hwnd = weak.update(cx, |view, _cx| view.hwnd)?;
+            if let Some(hwnd) = hwnd {
+                show_window(hwnd);
             }
         }
         TrayAction::Quit => {
@@ -626,7 +576,6 @@ fn sub_badge(state: SubStatus) -> impl IntoElement {
 
 /// Raw Win32 handle for our own window. wgpui exposes no hide API, so
 /// visibility goes through Win32, the same approach as the eframe app.
-#[cfg(windows)]
 fn win_hwnd(window: &Window) -> Option<isize> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -640,7 +589,6 @@ fn win_hwnd(window: &Window) -> Option<isize> {
 
 /// The close button hides to the tray; without a tray it would strand
 /// invisible, so this helper is only used when one exists.
-#[cfg(windows)]
 fn hide_window(hwnd: isize) {
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::UI::WindowsAndMessaging as wam;
@@ -655,7 +603,6 @@ fn hide_window(hwnd: isize) {
 
 /// A hidden tray app needs no resident pages: page everything out and let
 /// faults bring back only what the worker threads touch.
-#[cfg(windows)]
 fn trim_working_set() {
     use windows_sys::Win32::System::ProcessStatus::{
         GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
@@ -684,7 +631,6 @@ fn trim_working_set() {
 }
 
 /// Unhide + focus our own window.
-#[cfg(windows)]
 fn show_window(hwnd: isize) {
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::UI::WindowsAndMessaging as wam;

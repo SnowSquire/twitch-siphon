@@ -1,13 +1,3 @@
-//! Self-update check against GitHub Releases.
-//!
-//! The work thread polls the latest published release and compares it to
-//! this build's version; a newer one surfaces as a button in the top bar.
-//! Toast clicks never upgrade anything. MSI installs download the installer
-//! and hand it to a detached waiter that runs `msiexec` to completion and
-//! then reopens the app (its `MajorUpgrade` replaces the app, no elevation
-//! needed for the per-user install). Portable builds just open the release
-//! page, since a running exe cannot replace itself.
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -110,26 +100,19 @@ pub enum InstallMode {
 }
 
 /// An MSI install lives under the `InstallDir` the installer recorded;
-/// anything else (portable exe, dev build, non-Windows) is standalone.
+/// anything else (portable exe, dev build) is standalone.
 pub fn install_mode() -> InstallMode {
-    #[cfg(windows)]
-    {
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(Path::to_path_buf));
-        let install_dir = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
-            .open_subkey(INSTALL_KEY)
-            .and_then(|key| key.get_value::<String, _>("InstallDir"))
-            .ok()
-            .map(PathBuf::from);
-        match (exe_dir, install_dir) {
-            (Some(exe), Some(installed)) if exe.starts_with(&installed) => InstallMode::Msi,
-            _ => InstallMode::Portable,
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        InstallMode::Portable
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let install_dir = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .open_subkey(INSTALL_KEY)
+        .and_then(|key| key.get_value::<String, _>("InstallDir"))
+        .ok()
+        .map(PathBuf::from);
+    match (exe_dir, install_dir) {
+        (Some(exe), Some(installed)) if exe.starts_with(&installed) => InstallMode::Msi,
+        _ => InstallMode::Portable,
     }
 }
 
@@ -143,7 +126,6 @@ pub async fn download_msi(url: &str, version: &str) -> Result<PathBuf, http::Err
 
 /// Builds the waiter script: installs the MSI, then reopens the app.
 /// Single quotes cover spaces in both paths; embedded quotes are doubled.
-#[cfg(windows)]
 fn relaunch_script(msi: &Path, exe: &Path) -> String {
     let quote = |path: &Path| path.display().to_string().replace('\'', "''");
     format!(
@@ -158,7 +140,6 @@ fn relaunch_script(msi: &Path, exe: &Path) -> String {
 /// completion, then starts the just-replaced exe (a failed install just
 /// reopens the current version). Returns once the waiter is spawned; the
 /// caller quits so no files are locked during the upgrade.
-#[cfg(windows)]
 pub fn install_msi_and_relaunch(msi: &Path) -> Result<(), http::Error> {
     use std::os::windows::process::CommandExt as _;
 

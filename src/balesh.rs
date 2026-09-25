@@ -53,11 +53,11 @@ impl serde::Serialize for NanoId {
     }
 }
 
-pub struct Rng {
+pub struct CheapRng {
     state: u64,
 }
 
-impl Rng {
+impl CheapRng {
     pub const fn new(state: u64) -> Self {
         Self { state }
     }

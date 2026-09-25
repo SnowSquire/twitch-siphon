@@ -10,7 +10,7 @@ use compio::ws::{WebSocketStream, connect_async};
 use futures_util::{FutureExt as _, StreamExt as _};
 use serde_json::{Value, json};
 
-use crate::balesh::{NanoId, Rng, Topic};
+use crate::balesh::{CheapRng, NanoId, Topic};
 
 use crate::http::{self, Game, User};
 use crate::matcher::Matcher;
@@ -105,7 +105,7 @@ pub struct Session {
     last_message: Instant,
     reconnect_at: Instant,
     reconnect_attempt: u32,
-    rng: Rng,
+    rng: CheapRng,
 }
 
 impl Session {
@@ -129,7 +129,7 @@ impl Session {
             last_message: Instant::now(),
             reconnect_at: Instant::now(),
             reconnect_attempt: 0,
-            rng: Rng::new(
+            rng: CheapRng::new(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_or(0x853c_49e6_748f_ea9b, |elapsed| elapsed.as_nanos() as u64),
@@ -482,7 +482,9 @@ impl Session {
                 self.reconnect_attempt = 0;
                 self.keepalive_secs = message["welcome"]["keepaliveSec"].as_u64().unwrap_or(15);
                 log::info!(target: "hermes", "welcome: keepalive={}s", self.keepalive_secs);
+                let toast_tx = self.work.borrow().toast_tx.clone();
                 notifier::notify(
+                    &toast_tx,
                     summary,
                     &format!("watching {} channel(s)", self.channels.len()),
                     self.preferences.sound,
@@ -662,7 +664,9 @@ impl Session {
             .flatten()
             .collect::<Vec<_>>()
             .join(" & ");
+            let toast_tx = self.work.borrow().toast_tx.clone();
             notifier::notify(
+                &toast_tx,
                 &format!("[{}] {what} changed", user.channel_display_name),
                 &lines.join("\n"),
                 self.preferences.sound,
@@ -703,7 +707,9 @@ impl Session {
                 });
                 self.emit_status(None);
                 let notified = if let Some((login, display_name, game, title, avatar)) = cached {
+                    let toast_tx = self.work.borrow().toast_tx.clone();
                     Self::notify_live(
+                        &toast_tx,
                         &display_name,
                         game.as_ref(),
                         title.as_deref(),
@@ -725,7 +731,9 @@ impl Session {
                         };
                         user.live = true;
                         if !notified {
+                            let toast_tx = self.work.borrow().toast_tx.clone();
                             Self::notify_live(
+                                &toast_tx,
                                 &user.channel_display_name,
                                 user.game.as_ref(),
                                 user.stream_title.as_deref(),
@@ -755,6 +763,7 @@ impl Session {
     /// "is LIVE" notification shared by the optimistic (cached baseline)
     /// and fallback (fresh gql user) paths.
     async fn notify_live(
+        toast_tx: &kanal::Sender<notifier::ToastJob>,
         display_name: &str,
         game: Option<&Game>,
         title: Option<&str>,
@@ -769,6 +778,7 @@ impl Session {
             (None, None) => String::new(),
         };
         notifier::notify(
+            toast_tx,
             &format!("[{display_name}] is LIVE"),
             &body,
             sound,
@@ -823,6 +833,7 @@ mod tests {
         let (_ui_tx, ui_rx) = kanal::unbounded();
         let (_tray_event_tx, tray_events) = kanal::unbounded();
         let (session_tx, command_rx) = kanal::unbounded();
+        let (toast_tx, _) = kanal::unbounded();
         let work = Rc::new(RefCell::new(WorkState::new(
             WorkContext {
                 config_path: std::env::temp_dir().join("siphon-hermes-test.json"),
@@ -830,6 +841,7 @@ mod tests {
                 ui_rx,
                 frame: SharedFrame::default(),
                 tray_events,
+                toast_tx,
                 gui: GuiSender::pair().0,
             },
             session_tx,

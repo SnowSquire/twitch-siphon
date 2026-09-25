@@ -19,6 +19,7 @@ use wgpui_kit::component::theme::ThemeMode;
 use crate::config::{Channel, Config};
 use crate::hermes;
 use crate::http;
+use crate::notifier::ToastJob;
 use crate::tray::TrayAction;
 use crate::update;
 
@@ -176,6 +177,7 @@ pub struct WorkContext {
     pub ui_rx: Receiver<UiIntent>,
     pub frame: SharedFrame,
     pub tray_events: Receiver<TrayAction>,
+    pub toast_tx: Sender<ToastJob>,
     pub gui: GuiSender,
 }
 
@@ -193,6 +195,7 @@ pub struct WorkState {
     pub(crate) ui_rx: kanal::AsyncReceiver<UiIntent>,
     frame: SharedFrame,
     pub(crate) tray_events: kanal::AsyncReceiver<TrayAction>,
+    pub(crate) toast_tx: Sender<ToastJob>,
     gui: GuiSender,
     pub(crate) pending_adds: Arc<RwLock<Vec<String>>>,
 }
@@ -215,6 +218,7 @@ impl WorkState {
             ui_rx: ctx.ui_rx.to_async(),
             frame: ctx.frame,
             tray_events: ctx.tray_events.to_async(),
+            toast_tx: ctx.toast_tx,
             pending_adds: Arc::new(RwLock::new(Vec::new())),
             gui: ctx.gui,
         }
@@ -617,15 +621,10 @@ impl WorkState {
 }
 
 /// Runs the downloaded package's installer, then reopens the app. Only
-/// MSI installs on Windows ever download, so other platforms reaching
-/// here is a bug, not a path.
-#[cfg(windows)]
+/// MSI installs ever download, so this always runs `msiexec` through the
+/// detached waiter in `update`.
 fn launch_installer(path: &Path) -> Result<(), http::Error> {
     update::install_msi_and_relaunch(path)
-}
-#[cfg(not(windows))]
-fn launch_installer(_path: &Path) -> Result<(), http::Error> {
-    Err("no installer for this platform".into())
 }
 
 #[cfg(test)]
@@ -640,6 +639,7 @@ mod tests {
         let (_ui_tx, ui_rx) = kanal::unbounded();
         let (_tray_event_tx, tray_events) = kanal::unbounded();
         let (session_tx, session_rx) = kanal::unbounded();
+        let (toast_tx, _) = kanal::unbounded();
         let work = Rc::new(RefCell::new(WorkState::new(
             WorkContext {
                 config_path: path,
@@ -648,6 +648,7 @@ mod tests {
                 frame: SharedFrame::new(FrameState::default()),
                 tray_events,
                 gui: GuiSender::pair().0,
+                toast_tx,
             },
             session_tx,
         )));
@@ -753,6 +754,7 @@ mod tests {
         let (_ui_tx, ui_rx) = kanal::unbounded();
         let (_tray_event_tx, tray_events) = kanal::unbounded();
         let (session_tx, session_rx) = kanal::unbounded();
+        let (toast_tx, _) = kanal::unbounded();
         let work = Rc::new(RefCell::new(WorkState::new(
             WorkContext {
                 config_path: path.clone(),
@@ -761,6 +763,7 @@ mod tests {
                 frame: shared.clone(),
                 tray_events,
                 gui: GuiSender::pair().0,
+                toast_tx,
             },
             session_tx,
         )));
@@ -797,6 +800,7 @@ mod tests {
         let (_ui_tx, ui_rx) = kanal::unbounded();
         let (_tray_event_tx, tray_events) = kanal::unbounded();
         let (session_tx, _session_rx) = kanal::unbounded::<hermes::Command>();
+        let (toast_tx, _) = kanal::unbounded();
         let work = Rc::new(RefCell::new(WorkState::new(
             WorkContext {
                 config_path: path.clone(),
@@ -805,6 +809,7 @@ mod tests {
                 frame: shared.clone(),
                 tray_events,
                 gui: GuiSender::pair().0,
+                toast_tx,
             },
             session_tx,
         )));

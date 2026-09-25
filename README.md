@@ -18,9 +18,6 @@ its title.
 Don't want to install anything? Grab the `Siphon_*_x64-portable.exe` from the
 same release instead: just download it and double-click to run.
 
-On Linux? Download the `.AppImage` from the same page, make it executable, and
-run it.
-
 ## How to use
 
 - **Add a streamer:** open Siphon, type their Twitch username, and add them to
@@ -57,9 +54,3 @@ Config lives at `%APPDATA%\com.iken.siphon\config.json`. Logs go to stderr; set
 
 Recommended IDE setup: [VS Code](https://code.visualstudio.com/) +
 [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer).
-
-Linux notes: targets are Windows, macOS, and Wayland. On Linux the tray icon
-uses a pure-Rust StatusNotifierItem implementation, so no tray dev-packages are
-needed to build. To actually see the icon, the desktop must speak
-StatusNotifierItem: KDE Plasma works out of the box, GNOME needs its
-AppIndicator extension (shipped by default on Ubuntu).

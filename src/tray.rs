@@ -1,9 +1,16 @@
-//! Raw `Shell_NotifyIconW` tray icon on a hidden message window. The icon,
+//! System tray icon with an Open/Quit menu; left-click shows the window
+//! without opening the menu.
+//!
+//! A raw `Shell_NotifyIconW` icon on a hidden message window: the icon,
 //! tooltip, and Open/Quit menu are registered directly with the shell, so
-//! clicks arrive as window messages on the GUI thread and forward into the
-//! [`kanal`] channel from [`spawn_proxy`]; there is no helper thread and no
-//! polling. Notifications stay on WinRT toasts in `notifier::windows`, never
-//! on the legacy `NIF_INFO` balloon this same struct could show.
+//! tray clicks arrive as window messages on the GUI thread and forward
+//! into a [`kanal`] channel with sends that never block; the work task and
+//! the GUI pump await tray events instead of polling. Notifications stay on
+//! WinRT toasts in `notifier`, never on the legacy `NIF_INFO` balloon this
+//! same struct could show.
+//! The `Tray` value must stay alive for the icon to remain: dropping it
+//! removes the icon, and `Tray` always owns one — absence of a tray is
+//! `Option<Tray>::None` at the call site, never a flag inside `Tray`.
 
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,11 +32,19 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     TrackPopupMenuEx, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, HWND_MESSAGE,
 };
 
-use super::TrayAction;
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TrayAction {
+    Show,
+    Quit,
+}
+
+/// Raw bytes of the bundled icon, included exactly once. The toast
+/// registration writes these to disk.
+pub static ICON_PNG: &[u8] = include_bytes!("../icons/icon.png");
 
 /// Bundled `.ico`; the shell picks its preferred image through the lookup
 /// call in `load_icon`.
-static ICON_ICO: &[u8] = include_bytes!("../../icons/icon.ico");
+static ICON_ICO: &[u8] = include_bytes!("../icons/icon.ico");
 
 const TRAY_ID: u32 = 1;
 /// Callback message the shell posts to the message window on tray input.

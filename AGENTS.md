@@ -4,16 +4,17 @@
 
 - `cargo run` / `cargo test` / `cargo build --release` — single binary crate `siphon`; binary lands at `target/release/siphon.exe`.
 - `cargo clippy --all-targets --locked` — must be clean: workspace lints deny warnings plus clippy `all`/`pedantic`/`nursery`. Plain clippy is enough; CI adds only a check-only Windows pass: `cargo clippy --all-targets --locked --target x86_64-pc-windows-msvc` (never links, no MSVC needed).
-- Linux build deps: `gcc pkg-config libgl-dev libegl-dev libwayland-dev libxkbcommon-dev`. Tray needs nothing extra (pure-Rust `ksni` backend, no GTK/appindicator).
-- Tests are offline-safe (`cargo test` needs no network/services): GQL decode fixtures, loopback HTTP server, temp files under `%TEMP%/siphon-*-<pid>.*`. Releases (`release.yml`): `v*` tag pushes reuse the tag; manual `workflow_dispatch` mints `<UTC-date>@<short-sha>` via the `setup` job (never a branch name). Both uploaders share that tag and stay `draft: true` (required for immutable releases); publishing is manual. Artifacts: portable exe + MSI (self-hosted cross-build, WiX on `windows-latest`) + AppImage; not a local concern. The MSI is per-user (no elevation, `%LocalAppData%`) via a frozen WiX template at `packaging/wix/main.wxs` — cargo-packager 0.11.8 has no scope option, so re-diff against upstream when bumping it.
+- Windows-only: no Linux/macOS targets. Builds need just the Rust toolchain
+- plus MSVC for linking.
+- Tests are offline-safe (`cargo test` needs no network/services): GQL decode fixtures, loopback HTTP server, temp files under `%TEMP%/siphon-*-<pid>.*`. Releases (`release.yml`): `v*` tag pushes reuse the tag; manual `workflow_dispatch` mints `<UTC-date>@<short-sha>` via the `setup` job (never a branch name). The upload stays `draft: true` (required for immutable releases); publishing is manual. Artifacts: portable exe + MSI (self-hosted cross-build, WiX on `windows-latest`); not a local concern. The MSI is per-user (no elevation, `%LocalAppData%`) via a frozen WiX template at `packaging/wix/main.wxs` — cargo-packager 0.11.8 has no scope option, so re-diff against upstream when bumping it.
 
 ## Architecture: GUI thread vs work thread
 
-- Entry: `src/main.rs`. GUI thread (`src/app.rs` `SiphonApp`, eframe/egui) is purely presentational: renders the latest `FrameState`, sends `UiIntent`s. All app state lives on one work thread as `Rc<RefCell<WorkState>>` (`src/state.rs`) running a compio thread-per-core runtime with `EventLoop::run()` + hermes `Session::run()` joined — no task is ever spawned (`src/event_loop.rs` polls GQL resolves via `FuturesUnordered`).
+- Entry: `src/main.rs`. GUI thread (`src/app.rs` `SiphonApp`, eframe/egui) is purely presentational: renders the latest `FrameState`, sends `UiIntent`s. All app state lives on one work thread as `Rc<RefCell<WorkState>>` (`src/state.rs`) running a compio thread-per-core runtime with `EventLoop::run()` + hermes `Session::run()` joined — no task is ever spawned (`src/event_loop.rs` polls background jobs via `FuturesUnordered`).
 - Cross-thread wire is only `kanal` channels: `UiIntent` GUI→work, `FrameState` snapshots plus `GuiEvent` (`Frame`/`Theme`/`Tray`) work→GUI through one `GuiSender`, `TrayAction` tray-proxy→work via `tray::spawn_proxy`.
 - compio is thread-per-core, so futures are intentionally `!Send` (`future_not_send` allow in `Cargo.toml`). Never hold a `RefCell` borrow across an `.await`: follow the `stage_*` (sync, under one short borrow) + `commit_save` (async, no borrow held) split in `state.rs`.
 - `Config::load` is sync and only for `main` before any runtime exists; on the work thread only use async `Config::save` (compio fs) so the runtime never blocks.
-- Tray (`src/tray.rs`): build inside the `run_native` creator closure (required thread affinity on Windows/macOS); the returned `Tray` value must stay alive (dropping removes the icon); `None` means close-to-quit instead of close-to-tray.
+- Tray (`src/tray.rs`): built on the GUI thread inside `Application::run` (required thread affinity); the returned `Tray` value must stay alive (dropping removes the icon); `None` means close-to-quit instead of close-to-tray.
 
 ## Gotchas
 

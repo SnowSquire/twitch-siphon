@@ -11,8 +11,8 @@ edition = "2024"
 
 [dependencies]
 # UI: wgpui (retained, wgpu + winit) with the Kit component façade for inputs
-# and buttons. Backend selection follows wgpui's wgpu (Vulkan on
-# Windows/Linux, Metal on macOS); there is no backend pinning here.
+# and buttons. Backend selection follows wgpui's wgpu (Vulkan); there is no
+# backend pinning here.
 wgpui = "0.3.6"
 wgpui-kit = "0.6.1"
 # Sync+async MPMC channels bridging the GUI thread and the work runtime.
@@ -26,7 +26,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 semver = "1"
 compio = { version = "0.19", features = [
-  "macros",
   "fs",
   "runtime",
   "time",
@@ -35,21 +34,21 @@ compio = { version = "0.19", features = [
   "ws-connect",
   "tls",
   "rustls",
-  "webpki-roots",
+  "rustls-platform-verifier",
 ] }
-cyper = { version = "0.9", features = ["json", "stream"] }
+# Single TLS stack: rustls against the OS trust store everywhere. cyper's
+# `rustls` is `rustls-platform-verifier`, and compio-ws gets the same
+# verifier instead of the Mozilla bundle, so `native-tls` (SChannel/OpenSSL)
+# is out of our subgraph. cyper defaults stay off: its default is `native-tls`.
+cyper = { version = "0.9", default-features = false, features = ["stream", "rustls"] }
 futures-util = { version = "0.3", default-features = false, features = [
   "std",
-  "sink",
   "async-await-macro",
 ] }
 log = "0.4"
-
-
-[target."cfg(windows)".dependencies]
 winreg = "0.55"
 tauri-winrt-notification = "0.8"
-# WinRT system theme notifications (no new threads: callbacks notify through
+# WinRT system theme notifications (no new thread: callbacks notify through
 # the existing gui sender from the system pool).
 windows = { version = "0.62", features = [
   "Foundation",
@@ -67,10 +66,6 @@ windows-sys = { version = "0.61", features = [
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
-
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-notify-rust = { version = "4", features = ["async"] }
-
 
 [package.metadata.packager]
 productName = "Siphon"

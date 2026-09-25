@@ -46,7 +46,6 @@ fn main() {
         return;
     }
 
-    #[cfg(target_os = "windows")]
     notifier::register_aumid();
 
     let config_path = dirs::config_dir()
@@ -69,6 +68,7 @@ fn main() {
     );
 
     let (ui_tx, ui_rx) = kanal::unbounded::<UiIntent>();
+    let (toast_tx, toast_rx) = kanal::unbounded::<notifier::ToastJob>();
     let tray_events = tray::spawn_proxy();
     let (gui_tx, gui_rx) = GuiSender::pair();
     // Latest-only snapshot slot shared by the work thread (writer) and the
@@ -83,14 +83,12 @@ fn main() {
     //worker thread, runs hermes and event loop
     let work_frame = frame.clone();
     let wake_gui = gui_tx.clone();
-    #[cfg(windows)]
     let theme_gui = gui_tx.clone();
     let _work_thread = std::thread::Builder::new()
         .name("worker thread".to_owned())
         .spawn(move || {
             // System theme notifications land here: no new thread, and COM
             // stays off the foreground thread's clipboard apartment.
-            #[cfg(windows)]
             crate::app::watch_system_theme(theme_gui);
             {
                 compio::runtime::Runtime::new()
@@ -104,13 +102,14 @@ fn main() {
                                 ui_rx,
                                 frame: work_frame,
                                 tray_events,
+                                toast_tx,
                                 gui: gui_tx,
                             },
                             session_tx,
                         )));
                         work.borrow().push_frame();
                         let mut hermes = Session::new(Rc::clone(&work), command_rx.to_async());
-                        let mut events = EventLoop::new(work);
+                        let mut events = EventLoop::new(work, toast_rx.to_async());
 
                         futures_util::future::join(events.run(), hermes.run()).await;
                     });

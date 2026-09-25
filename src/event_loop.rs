@@ -1,6 +1,6 @@
-//! UI intent pump. Awaits UI intents, tray events, and background job
-//! completions; the runtime otherwise sleeps. Intent handling is
-//! synchronous; channel resolves and update jobs wait in one
+//! UI intent pump. Awaits UI intents, tray events, toast requests, and
+//! background job completions; the runtime otherwise sleeps. Intent handling
+//! is synchronous; channel resolves, update steps, and toasts wait in one
 //! `FuturesUnordered` polled by this same routine, so no task is ever
 //! spawned.
 
@@ -14,16 +14,19 @@ use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt as _, StreamExt as _};
 
 use crate::http;
+use crate::notifier::{self, ToastJob};
 use crate::state::{UiIntent, WorkState};
 use crate::update;
 
-/// One finished background job: a channel resolve or an update step.
-/// Both kinds share the queue; completions dispatch in [`EventLoop::handle_job`].
+/// One finished background job: a channel resolve, an update step, or a
+/// shown toast. All kinds share the queue; completions dispatch in
+/// [`EventLoop::handle_job`].
 enum JobDone {
     ChannelResolved(String, Result<Vec<http::User>, http::Error>),
     UpdateCheckFinished,
     UpdateCheckDue,
     UpdateDownloadFinished(Result<PathBuf, http::Error>),
+    ToastShown,
 }
 /// One in-flight job. `!Send` is fine: everything stays on this one
 /// thread-per-core runtime thread.
@@ -31,13 +34,15 @@ type JobFuture = Pin<Box<dyn Future<Output = JobDone>>>;
 
 pub struct EventLoop {
     work: Rc<RefCell<WorkState>>,
+    toast_rx: kanal::AsyncReceiver<ToastJob>,
     jobs: FuturesUnordered<JobFuture>,
 }
 
 impl EventLoop {
-    pub fn new(work: Rc<RefCell<WorkState>>) -> Self {
+    pub fn new(work: Rc<RefCell<WorkState>>, toast_rx: kanal::AsyncReceiver<ToastJob>) -> Self {
         let this = Self {
             work: Rc::clone(&work),
+            toast_rx,
             jobs: FuturesUnordered::new(),
         };
         // Check immediately at startup; completions re-arm the interval.
@@ -62,9 +67,19 @@ impl EventLoop {
         }));
     }
 
+    /// Queues one toast for display. Showing parks only this job;
+    /// intents and session traffic keep flowing through the loop.
+    fn push_toast(&self, job: ToastJob) {
+        self.jobs.push(Box::pin(async move {
+            notifier::display(job);
+            JobDone::ToastShown
+        }));
+    }
+
     pub async fn run(&mut self) {
         let ui_rx = self.work.borrow().ui_rx.clone();
         let tray_rx = self.work.borrow().tray_events.clone();
+        let toast_rx = self.toast_rx.clone();
         loop {
             futures_util::select! {
                 intent = ui_rx.recv().fuse() => {
@@ -76,6 +91,12 @@ impl EventLoop {
                 action = tray_rx.recv().fuse() => {
                     match action {
                         Ok(action) => self.work.borrow().forward_tray(action),
+                        Err(_) => break,
+                    }
+                }
+                toast = toast_rx.recv().fuse() => {
+                    match toast {
+                        Ok(job) => self.push_toast(job),
                         Err(_) => break,
                     }
                 }
@@ -110,6 +131,7 @@ impl EventLoop {
             JobDone::UpdateDownloadFinished(result) => {
                 self.work.borrow_mut().finish_update_download(result);
             }
+            JobDone::ToastShown => {}
         }
     }
 

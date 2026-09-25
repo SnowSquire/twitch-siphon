@@ -10,8 +10,7 @@ const KEEP_FILES: usize = 5;
 /// Per-file cap; evenly divides the total.
 const MAX_FILE_BYTES: u64 = MAX_TOTAL_BYTES / KEEP_FILES as u64;
 
-/// Platform log directory: `LocalAppData` on Windows, the equivalent
-/// application-data directory elsewhere.
+/// Log directory: the app's folder under local app-data.
 #[must_use]
 pub fn log_dir(app_id: &str) -> PathBuf {
     dirs::data_local_dir()
