@@ -242,9 +242,6 @@ impl WorkState {
         self.gui.notify_tray(action);
     }
 
-    /// Validates an add request. Returns the normalized login when a resolve
-    /// is worthwhile; duplicates, in-flight resolves, and empty input are
-    /// silently ignored.
     pub fn begin_add_login(&mut self, login: &str) -> Option<String> {
         let login = login.trim().to_lowercase();
         if login.is_empty()
@@ -276,7 +273,7 @@ impl WorkState {
     pub async fn finish_add_login(
         work: &Rc<RefCell<Self>>,
         login: String,
-        result: Result<Vec<http::User>, http::Error>,
+        result: anyhow::Result<Option<http::User>>,
     ) {
         let pending = work.borrow_mut().stage_finish_add_login(&login, result);
         let finished_without_save = pending.is_none();
@@ -408,7 +405,7 @@ impl WorkState {
     /// quits so no files are locked; the updater reopens the app once the
     /// install finishes. Failures revert to the offer with an error, so
     /// the button retries.
-    pub fn finish_update_download(&mut self, result: Result<PathBuf, http::Error>) {
+    pub fn finish_update_download(&mut self, result: anyhow::Result<PathBuf>) {
         let info = match &self.update {
             UpdateStatus::Downloading(info) => info.clone(),
             _ => return,
@@ -461,24 +458,14 @@ impl WorkState {
     fn stage_finish_add_login(
         &mut self,
         login: &str,
-        result: Result<Vec<http::User>, http::Error>,
+        result: anyhow::Result<Option<http::User>>,
     ) -> Option<PendingSave> {
         match result {
-            Ok(users) => {
+            Ok(Some(user)) => {
                 if let Ok(mut v) = self.pending_adds.write() {
                     v.retain(|item| !item.eq_ignore_ascii_case(login));
                 }
-                let user = users
-                    .into_iter()
-                    .find(|user| user.channel_name.eq_ignore_ascii_case(login));
-                let Some(user) = user else {
-                    log::info!(
-                        target: "config",
-                        "gql returned no channel named {login}, is it a typo?"
-                    );
-                    self.set_error(format!("channel {login} not found"));
-                    return None;
-                };
+
                 log::info!(
                     target: "config",
                     "resolved {} to id {} ({})",
@@ -502,6 +489,17 @@ impl WorkState {
                 let forward_login = channel.login.clone();
                 Rc::make_mut(&mut self.config).channels.push(channel);
                 Some(self.stage_save(hermes::Command::AddChannel(forward_login)))
+            }
+            Ok(None) => {
+                if let Ok(mut v) = self.pending_adds.write() {
+                    v.retain(|item| !item.eq_ignore_ascii_case(login));
+                }
+                log::info!(
+                    target: "config",
+                    "gql returned no channel named {login}, is it a typo?"
+                );
+                self.set_error(format!("channel {login} not found"));
+                None
             }
             Err(error) => {
                 if let Ok(mut v) = self.pending_adds.write() {
@@ -623,7 +621,7 @@ impl WorkState {
 /// Runs the downloaded package's installer, then reopens the app. Only
 /// MSI installs ever download, so this always runs `msiexec` through the
 /// detached waiter in `update`.
-fn launch_installer(path: &Path) -> Result<(), http::Error> {
+fn launch_installer(path: &Path) -> anyhow::Result<()> {
     update::install_msi_and_relaunch(path)
 }
 
@@ -731,7 +729,7 @@ mod tests {
 
         block_on(async {
             compio::fs::remove_file(&path).await.ok();
-            WorkState::finish_add_login(&work, "alice".to_owned(), Ok(vec![user])).await;
+            WorkState::finish_add_login(&work, "alice".to_owned(), Ok(Some(user))).await;
 
             let saved = saved_config(&path).await;
             assert_eq!(saved.channels.len(), 1);
@@ -770,7 +768,7 @@ mod tests {
 
         block_on(async {
             compio::fs::remove_file(&path).await.ok();
-            WorkState::finish_add_login(&work, "typo".to_owned(), Ok(Vec::new())).await;
+            WorkState::finish_add_login(&work, "typo".to_owned(), Ok(None)).await;
 
             assert!(
                 !file_exists(&path).await,
@@ -784,6 +782,41 @@ mod tests {
             assert!(
                 !frame.error.is_empty(),
                 "unresolvable logins must surface an error"
+            );
+        });
+    }
+
+    #[test]
+    fn finish_add_login_surfaces_transport_error_without_touching_disk() {
+        let path = std::env::temp_dir().join(format!(
+            "siphon-state-resolve-err-{}.json",
+            std::process::id()
+        ));
+        let (work, session_rx) = test_work(Config::default(), path.clone());
+        let shared = work.borrow().frame.clone();
+
+        block_on(async {
+            compio::fs::remove_file(&path).await.ok();
+            WorkState::finish_add_login(
+                &work,
+                "alice".to_owned(),
+                Err(anyhow::anyhow!("boom")),
+            )
+            .await;
+
+            assert!(
+                !file_exists(&path).await,
+                "failures must not create a config file"
+            );
+            assert!(
+                session_rx.is_empty(),
+                "failed resolves must not reach the session"
+            );
+            let (frame, _) = shared.load_newer(0).expect("error frame pushed");
+            assert!(
+                frame.error.contains("failed to resolve alice"),
+                "transport errors keep their cause, got: {}",
+                frame.error
             );
         });
     }

@@ -17,6 +17,7 @@ wgpui = "0.3.6"
 wgpui-kit = "0.6.1"
 # Sync+async MPMC channels bridging the GUI thread and the work runtime.
 kanal = "0.1"
+anyhow = "1"
 app-single-instance = "0.1"
 raw-window-handle = "0.6"
 dirs = "6"

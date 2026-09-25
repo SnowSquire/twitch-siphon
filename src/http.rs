@@ -2,8 +2,7 @@ use compio::fs::File;
 use compio::io::AsyncWriteAtExt;
 use futures_util::StreamExt;
 use serde::{Deserialize, Deserializer};
-use serde_json::{Value, json};
-use std::error::Error as StdError;
+use serde_json::json;
 use std::path::Path;
 use std::time::Duration;
 
@@ -16,14 +15,12 @@ const GQL_TIMEOUT: Duration = Duration::from_secs(15);
 // cyper's `Client` is thread-local (`!Send + !Sync`, backed by `Rc`), so it
 // cannot live in a shared static. Each compio runtime thread builds its own
 // (fetches here are infrequent: connect/add/stream-up, plus avatar downloads).
-pub(crate) fn client() -> Result<cyper::Client, Error> {
+pub(crate) fn client() -> anyhow::Result<cyper::Client> {
     Ok(cyper::Client::new()?)
 }
 
 const USERS_BY_IDS_QUERY: &str = "query UsersByIds($ids:[ID!]){users(ids:$ids){id login displayName profileImageURL(width:70) broadcastSettings{id title game{id name displayName}}stream{id createdAt}}}";
-const USERS_BY_LOGINS_QUERY: &str = "query UsersByLogins($logins:[String!]){users(logins:$logins){id login displayName profileImageURL(width:70) broadcastSettings{id title game{id name displayName}}stream{id createdAt}}}";
-
-pub type Error = Box<dyn StdError + Send + Sync>;
+const USER_BY_LOGIN_QUERY: &str = "query UserByLogin($login:String!){user(login:$login){id login displayName profileImageURL(width:70) broadcastSettings{id title game{id name displayName}}stream{id createdAt}}}";
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -48,16 +45,28 @@ pub struct User {
     pub live: bool,
 }
 
-// Typed mirror of the batched GQL response. Decoding straight into these
+// Typed mirror of the GQL responses. Decoding straight into these
 // (instead of `serde_json::Value`) skips the generic map allocation and
-// gives every field a concrete type; unknown fields are ignored.
+// gives every field a concrete type; unknown fields are ignored. Every
+// nullable layer stays `Option` so one missing user or null `data`
+// collapses to `None` instead of failing the whole decode.
 #[derive(Debug, Deserialize)]
-struct GqlOperationResponse {
-    data: Option<GqlData>,
+struct GqlIdsResponse {
+    data: Option<GqlIdsData>,
 }
 
 #[derive(Debug, Deserialize)]
-struct GqlData {
+struct GqlLoginResponse {
+    data: Option<GqlLoginData>,
+}
+#[derive(Debug, Deserialize)]
+struct GqlLoginData {
+    #[serde(default)]
+    user: Option<GqlUser>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GqlIdsData {
     #[serde(default)]
     users: Option<Vec<Option<GqlUser>>>,
 }
@@ -149,53 +158,91 @@ impl GqlUser {
     }
 }
 
-pub async fn fetch_users(ids: &[u64], logins: &[String]) -> Result<Vec<User>, Error> {
-    let mut operations = Vec::with_capacity(2);
-    if !ids.is_empty() {
-        operations.push(json!({
-            "query": USERS_BY_IDS_QUERY,
-            "variables": {
-                "ids": ids.iter().map(ToString::to_string).collect::<Vec<_>>()
-            },
-            "operationName": "UsersByIds",
-        }));
-    }
-    if !logins.is_empty() {
-        operations.push(json!({
-            "query": USERS_BY_LOGINS_QUERY,
-            "variables": { "logins": logins },
-            "operationName": "UsersByLogins",
-        }));
-    }
-    log::info!(target: "gql", "request: ids={ids:?} logins={logins:?}");
-
-    let payload = serde_json::to_vec(&Value::Array(operations))?;
+/// Resolves one login. `Ok(None)` means the login does not resolve
+/// (unknown login or unparseable user); `Err` is transport/decode failure.
+pub async fn fetch_user(login: &str) -> anyhow::Result<Option<User>> {
     let client = client()?;
+    log::info!(target: "gql", "request: login={login:?}");
     let response = compio::time::timeout(
         GQL_TIMEOUT,
         client
             .post(GQL_URL)?
             .header("Content-Type", "application/json")?
             .header("Client-ID", CLIENT_ID)?
-            .body(payload)
+            .body(serde_json::to_vec(&json!({
+                "query": USER_BY_LOGIN_QUERY,
+                "variables": {
+                    "login": login
+                },
+                "operationName": "UserByLogin",
+            }))?)
             .send(),
     )
     .await
-    .map_err(|_| "gql request timed out")??;
+    .map_err(|_| anyhow::anyhow!("gql request timed out"))??;
 
     if !response.status().is_success() {
-        return Err(format!("gql returned status {}", response.status()).into());
+        return Err(anyhow::anyhow!("gql returned status {}", response.status()));
     }
     let body = compio::time::timeout(GQL_TIMEOUT, response.bytes())
         .await
-        .map_err(|_| "gql body read timed out")??;
-    // Single-pass typed decode: no intermediate `Value` map. A shape
-    // mismatch surfaces to the caller; per-user gaps still collapse to `None` above.
-    let responses: Vec<GqlOperationResponse> = serde_json::from_slice(&body)?;
-    let users = responses
+        .map_err(|_| anyhow::anyhow!("gql body read timed out"))??;
+
+    let response: GqlLoginResponse = serde_json::from_slice(&body)?;
+    let user = response
+        .data
+        .and_then(|data| data.user)
+        .and_then(GqlUser::into_user)
+        .filter(|user| user.channel_name.eq_ignore_ascii_case(login));
+
+    if let Some(user) = &user {
+        log::info!(
+            target: "gql",
+            "parsed user {}({}){}",
+            user.channel_name,
+            user.channel_id,
+            if user.live { " live" } else { "" }
+        );
+    } else {
+        log::info!(target: "gql", "no user resolved for login={login:?}");
+    }
+    Ok(user)
+}
+
+pub async fn fetch_users(ids: &[u64]) -> anyhow::Result<Vec<User>> {
+    let client = client()?;
+    log::info!(target: "gql", "request: ids={ids:?}");
+    let response = compio::time::timeout(
+        GQL_TIMEOUT,
+        client
+            .post(GQL_URL)?
+            .header("Content-Type", "application/json")?
+            .header("Client-ID", CLIENT_ID)?
+            .body(serde_json::to_vec(&json!({
+                "query": USERS_BY_IDS_QUERY,
+                "variables": {
+                    "ids": ids.iter().map(ToString::to_string).collect::<Vec<_>>()
+                },
+                "operationName": "UsersByIds",
+            }))?)
+            .send(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("gql request timed out"))??;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!("gql returned status {}", response.status()));
+    }
+    let body = compio::time::timeout(GQL_TIMEOUT, response.bytes())
+        .await
+        .map_err(|_| anyhow::anyhow!("gql body read timed out"))??;
+
+    let response: GqlIdsResponse = serde_json::from_slice(&body)?;
+    let users = response
+        .data
+        .and_then(|data| data.users)
+        .unwrap_or_default()
         .into_iter()
-        .filter_map(|response| response.data.and_then(|data| data.users))
-        .flatten()
         .filter_map(|raw| raw.and_then(GqlUser::into_user))
         .collect::<Vec<_>>();
 
@@ -217,17 +264,15 @@ pub async fn fetch_users(ids: &[u64], logins: &[String]) -> Result<Vec<User>, Er
     Ok(users)
 }
 
-/// downloads an arbitrary cdn file (e.g. a profile picture) to `path`,
-/// streaming body chunks straight to disk so the whole body is never
-/// buffered in memory. A failed download removes the partial file, since
-/// the avatar cache skips urls whose file already exists and would
-/// otherwise pin the corruption.
-pub async fn fetch_file(url: &str, path: impl AsRef<Path>) -> Result<(), Error> {
+pub async fn fetch_file(url: &str, path: impl AsRef<Path>) -> anyhow::Result<()> {
     let response = compio::time::timeout(GQL_TIMEOUT, client()?.get(url)?.send())
         .await
-        .map_err(|_| "image request timed out")??;
+        .map_err(|_| anyhow::anyhow!("image request timed out"))??;
     if !response.status().is_success() {
-        return Err(format!("image returned status {}", response.status()).into());
+        return Err(anyhow::anyhow!(
+            "image returned status {}",
+            response.status()
+        ));
     }
     let path = path.as_ref();
     if let Err(error) = stream_to_file(response, path).await {
@@ -237,17 +282,14 @@ pub async fn fetch_file(url: &str, path: impl AsRef<Path>) -> Result<(), Error> 
     Ok(())
 }
 
-/// Pipes one response body to `path` chunk by chunk over async file writes
-/// (no intermediate buffer); each stalled chunk trips `GQL_TIMEOUT`.
-async fn stream_to_file(response: cyper::Response, path: &Path) -> Result<(), Error> {
+async fn stream_to_file(response: cyper::Response, path: &Path) -> anyhow::Result<()> {
     let mut file = File::create(path).await?;
     let mut stream = response.bytes_stream();
     let mut pos: u64 = 0;
-    loop {
-        let next = compio::time::timeout(GQL_TIMEOUT, stream.next())
-            .await
-            .map_err(|_| "image body read timed out")?;
-        let Some(result) = next else { break };
+    while let Some(result) = compio::time::timeout(GQL_TIMEOUT, stream.next())
+        .await
+        .map_err(|_| anyhow::anyhow!("image body read timed out"))?
+    {
         let chunk = result?;
         let len = chunk.len() as u64;
         file.write_all_at(chunk, pos).await.0?;
@@ -261,29 +303,36 @@ async fn stream_to_file(response: cyper::Response, path: &Path) -> Result<(), Er
 mod tests {
     use std::future::Future;
 
-    use super::{GqlOperationResponse, GqlUser};
+    use super::{GqlIdsResponse, GqlLoginResponse, GqlUser};
 
     fn decode_users(body: &[u8]) -> Vec<super::User> {
-        let responses: Vec<GqlOperationResponse> = serde_json::from_slice(body).unwrap();
-        responses
+        let response: GqlIdsResponse = serde_json::from_slice(body).unwrap();
+        response
+            .data
+            .and_then(|data| data.users)
+            .unwrap_or_default()
             .into_iter()
-            .filter_map(|response| response.data.and_then(|data| data.users))
-            .flatten()
             .filter_map(|raw| raw.and_then(GqlUser::into_user))
             .collect()
     }
 
+    fn decode_login(body: &[u8]) -> Option<super::User> {
+        let response: GqlLoginResponse = serde_json::from_slice(body).unwrap();
+        response
+            .data
+            .and_then(|data| data.user)
+            .and_then(GqlUser::into_user)
+    }
+
     #[test]
     fn typed_decode_keeps_live_user_with_game() {
-        let body = br#"[
-            {"data": {"users": [
+        let body = br#"{"data": {"users": [
                 {"id": "123", "login": "alice", "displayName": "Alice",
                  "profileImageURL": "http://x/y.png",
                  "broadcastSettings": {"id": "999", "title": "hi",
                     "game": {"id": "10", "name": "g", "displayName": "G"}},
                  "stream": {"id": "1", "createdAt": "2026-09-10T18:35:06Z"}}
-            ]}}
-        ]"#;
+            ]}}"#;
         let users = decode_users(body);
         assert_eq!(users.len(), 1, "{users:?}");
         let user = &users[0];
@@ -306,14 +355,12 @@ mod tests {
 
     #[test]
     fn typed_decode_accepts_numeric_ids_and_offline_user() {
-        let body = br#"[
-            {"data": {"users": [
+        let body = br#"{"data": {"users": [
                 {"id": 456, "login": "bob", "displayName": "Bob",
                  "profileImageURL": "http://x/z.png",
                  "broadcastSettings": {"id": 777, "title": "", "game": null},
                  "stream": null}
-            ]}}
-        ]"#;
+            ]}}"#;
         let users = decode_users(body);
         assert_eq!(users.len(), 1, "{users:?}");
         let user = &users[0];
@@ -327,8 +374,7 @@ mod tests {
 
     #[test]
     fn typed_decode_skips_bad_entries_but_keeps_batch() {
-        let body = br#"[
-            {"data": {"users": [
+        let body = br#"{"data": {"users": [
                 null,
                 {"id": "bad", "login": "ghost",
                  "broadcastSettings": {"id": "1", "title": "t", "game": null},
@@ -340,13 +386,50 @@ mod tests {
                  "broadcastSettings": {"id": "999", "title": "hi",
                     "game": {"id": "10", "name": "g", "displayName": "G"}},
                  "stream": {"id": "1", "createdAt": "2026-09-10T18:35:06Z"}}
-            ]}},
-            {"data": null},
-            {"data": {"users": null}}
-        ]"#;
+            ]}}"#;
         let users = decode_users(body);
         assert_eq!(users.len(), 1, "{users:?}");
         assert_eq!(users[0].channel_id, 123);
+    }
+
+    #[test]
+    fn typed_decode_tolerates_null_data_and_users() {
+        assert!(decode_users(br#"{"data": null}"#).is_empty());
+        assert!(decode_users(br#"{"data": {}}"#).is_empty());
+        assert!(decode_users(br#"{"data": {"users": null}}"#).is_empty());
+    }
+
+    #[test]
+    fn login_decode_keeps_live_user_with_game() {
+        let body = br#"{"data": {"user":
+                {"id": "123", "login": "alice", "displayName": "Alice",
+                 "profileImageURL": "http://x/y.png",
+                 "broadcastSettings": {"id": "999", "title": "hi",
+                    "game": {"id": "10", "name": "g", "displayName": "G"}},
+                 "stream": {"id": "1", "createdAt": "2026-09-10T18:35:06Z"}}
+            }}"#;
+        let user = decode_login(body).expect("user should decode");
+        assert_eq!(user.channel_id, 123);
+        assert_eq!(user.channel_name, "alice");
+        assert_eq!(user.stream_id, 999);
+        assert!(user.live);
+    }
+
+    #[test]
+    fn login_decode_maps_unknown_or_bad_user_to_none() {
+        assert!(decode_login(br#"{"data": {"user": null}}"#).is_none());
+        assert!(decode_login(br#"{"data": null}"#).is_none());
+        // Missing broadcast settings cannot build a `User`.
+        assert!(
+            decode_login(
+                br#"{"data": {"user":
+                    {"id": "123", "login": "alice", "displayName": "Alice",
+                     "profileImageURL": "http://x/y.png",
+                     "broadcastSettings": null, "stream": null}
+                }}"#
+            )
+            .is_none()
+        );
     }
 
     /// Serves one static HTTP response on loopback; the returned future

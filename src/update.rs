@@ -3,14 +3,10 @@ use std::time::Duration;
 
 use crate::http;
 
-/// How often the work thread re-checks while running. Kept in memory only:
-///
-/// the check is cheap and a restart re-checks anyway.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 const RELEASES_URL: &str = "https://api.github.com/repos/SnowSquire/twitch-siphon/releases/latest";
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(15);
-/// Registry key the WiX installer records the install dir under
-/// (`packaging/wix/main.wxs` writes `HKCU\Software\Ozeniken\Siphon`).
+
 const INSTALL_KEY: &str = "Software\\Ozeniken\\Siphon";
 
 /// A published release worth offering: the version plus where to get it.
@@ -38,11 +34,11 @@ struct AssetJson {
 
 /// Decodes one `releases/latest` body. Tags carry a `v` prefix (`v0.1.3`);
 /// anything that is not semver after stripping it is refused.
-pub fn parse_release(body: &[u8]) -> Result<Release, http::Error> {
+pub fn parse_release(body: &[u8]) -> anyhow::Result<Release> {
     let json: ReleaseJson = serde_json::from_slice(body)?;
     let tag = json.tag_name.strip_prefix('v').unwrap_or(&json.tag_name);
     let version = semver::Version::parse(tag)
-        .map_err(|error| format!("bad release tag {}: {error}", json.tag_name))?;
+        .map_err(|error| anyhow::anyhow!("bad release tag {}: {error}", json.tag_name))?;
     let msi_url = json
         .assets
         .into_iter()
@@ -67,11 +63,11 @@ pub fn newer_than_current(release: &Release) -> bool {
 
 /// Fetches the latest published release. Draft releases are invisible to
 /// this endpoint, so an update only appears once the release is published.
-pub async fn fetch_latest() -> Result<Release, http::Error> {
+pub async fn fetch_latest() -> anyhow::Result<Release> {
     fetch_latest_from(RELEASES_URL).await
 }
 
-async fn fetch_latest_from(url: &str) -> Result<Release, http::Error> {
+async fn fetch_latest_from(url: &str) -> anyhow::Result<Release> {
     // GitHub rejects API calls without a User-Agent.
     let response = compio::time::timeout(
         UPDATE_TIMEOUT,
@@ -82,13 +78,16 @@ async fn fetch_latest_from(url: &str) -> Result<Release, http::Error> {
             .send(),
     )
     .await
-    .map_err(|_| "update request timed out")??;
+    .map_err(|_| anyhow::anyhow!("update request timed out"))??;
     if !response.status().is_success() {
-        return Err(format!("update check returned status {}", response.status()).into());
+        return Err(anyhow::anyhow!(
+            "update check returned status {}",
+            response.status()
+        ));
     }
     let body = compio::time::timeout(UPDATE_TIMEOUT, response.bytes())
         .await
-        .map_err(|_| "update body read timed out")??;
+        .map_err(|_| anyhow::anyhow!("update body read timed out"))??;
     parse_release(&body)
 }
 
@@ -118,7 +117,7 @@ pub fn install_mode() -> InstallMode {
 
 /// Downloads the installer to the temp dir. Reuses the streaming fetch,
 /// so a failed download never leaves a partial `.msi` behind.
-pub async fn download_msi(url: &str, version: &str) -> Result<PathBuf, http::Error> {
+pub async fn download_msi(url: &str, version: &str) -> anyhow::Result<PathBuf> {
     let path = std::env::temp_dir().join(format!("siphon-update-{version}.msi"));
     http::fetch_file(url, &path).await?;
     Ok(path)
@@ -135,12 +134,7 @@ fn relaunch_script(msi: &Path, exe: &Path) -> String {
     )
 }
 
-/// Installs the MSI and reopens this app once it finishes. A detached
-/// PowerShell waiter outlives this process: it runs `msiexec` to
-/// completion, then starts the just-replaced exe (a failed install just
-/// reopens the current version). Returns once the waiter is spawned; the
-/// caller quits so no files are locked during the upgrade.
-pub fn install_msi_and_relaunch(msi: &Path) -> Result<(), http::Error> {
+pub fn install_msi_and_relaunch(msi: &Path) -> anyhow::Result<()> {
     use std::os::windows::process::CommandExt as _;
 
     let exe = std::env::current_exe()?;

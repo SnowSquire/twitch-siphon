@@ -247,24 +247,22 @@ impl Session {
         }
         log::info!(target: "hermes", "channel {login} added");
         // One targeted fetch seeds the notify baseline (title/game/live).
-        match http::fetch_users(&[], std::slice::from_ref(&login)).await {
-            Ok(mut users) => {
-                let user = users
-                    .pop()
-                    .filter(|user| user.channel_name.eq_ignore_ascii_case(&login));
-                if let Some(user) = user {
-                    let id = user.channel_id;
-                    self.upsert(user);
-                    self.after_resolve(id).await;
-                    self.emit_status(None);
-                } else {
-                    log::info!(
-                        target: "hermes",
-                        "gql returned no channel named {login}, is it a typo?"
-                    );
-                    self.emit_status(Some(&format!("channel {login} not found")));
-                    WorkState::apply_prune_login(&self.work, &login).await;
-                }
+        // Unknown logins are pruned; transport failures only surface a
+        // status so the persisted channel survives a retry.
+        match http::fetch_user(&login).await {
+            Ok(Some(user)) => {
+                let id = user.channel_id;
+                self.upsert(user);
+                self.after_resolve(id).await;
+                self.emit_status(None);
+            }
+            Ok(None) => {
+                log::info!(
+                    target: "hermes",
+                    "gql returned no channel named {login}, is it a typo?"
+                );
+                self.emit_status(Some(&format!("channel {login} not found")));
+                WorkState::apply_prune_login(&self.work, &login).await;
             }
             Err(error) => {
                 log::info!(target: "hermes", "failed to fetch channel: {error}");
@@ -361,7 +359,7 @@ impl Session {
         if ids.is_empty() {
             return;
         }
-        match http::fetch_users(ids, &[]).await {
+        match http::fetch_users(ids).await {
             Ok(users) => {
                 let mut seen = std::collections::HashSet::with_capacity(users.len());
                 for user in users {
@@ -722,7 +720,7 @@ impl Session {
                 } else {
                     false
                 };
-                match http::fetch_users(&[channel_id], &[]).await {
+                match http::fetch_users(&[channel_id]).await {
                     Ok(users) => {
                         let Some(mut user) =
                             users.into_iter().find(|user| user.channel_id == channel_id)

@@ -1,4 +1,3 @@
-use std::io::Error as IoError;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -62,24 +61,23 @@ impl Config {
     /// typed decoding, so shapes that no longer parse still migrate. Newer
     /// files are refused; older ones run one [`migrate_step`] per version
     /// until current, and only the result decodes into [`Config`].
-    fn load_versioned(path: &Path) -> Result<Self, String> {
-        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
-        let mut value: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    fn load_versioned(path: &Path) -> anyhow::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        let mut value: Value = serde_json::from_slice(&bytes)?;
         let from = value.get("version").and_then(Value::as_u64).unwrap_or(0);
         if from > u64::from(Self::VERSION) {
-            return Err(format!("ignoring config version {from}"));
+            return Err(anyhow::anyhow!("ignoring config version {from}"));
         }
         let map = value
             .as_object_mut()
-            .ok_or_else(|| "config root is not an object".to_owned())?;
+            .ok_or_else(|| anyhow::anyhow!("config root is not an object"))?;
         let mut version = from;
         while version < u64::from(Self::VERSION) {
             migrate_step(map, version)?;
             version += 1;
             map.insert("version".to_owned(), Value::from(version));
         }
-        let config: Self = serde_json::from_value(Value::Object(map.clone()))
-            .map_err(|error| error.to_string())?;
+        let config: Self = serde_json::from_value(Value::Object(map.clone()))?;
         if from < u64::from(Self::VERSION) {
             log::info!(
                 target: "config",
@@ -93,12 +91,13 @@ impl Config {
     /// Async so the work-thread runtime (thread-per-core) never blocks on
     /// disk: one chunked write straight from the serialized string, with no
     /// intermediate buffer beyond it.
-    pub async fn save(&self, path: &Path) -> Result<(), IoError> {
+    pub async fn save(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             compio::fs::create_dir_all(parent).await?;
         }
-        let json = serde_json::to_string_pretty(self).map_err(IoError::other)?;
-        compio::fs::write(path, json).await.0
+        let json = serde_json::to_string_pretty(self)?;
+        compio::fs::write(path, json).await.0?;
+        Ok(())
     }
 }
 
@@ -108,7 +107,7 @@ impl Config {
 /// any number of versions behind still converges. The coverage test below
 /// calls every version in `0..VERSION`, so bumping `VERSION` without adding
 /// its arm fails `cargo test`.
-fn migrate_step(map: &mut Map<String, Value>, version: u64) -> Result<(), String> {
+fn migrate_step(map: &mut Map<String, Value>, version: u64) -> anyhow::Result<()> {
     match version {
         // v0 predates versioning but shares v1's shape: stamping (done by the
         // caller) is the whole migration.
@@ -124,7 +123,7 @@ fn migrate_step(map: &mut Map<String, Value>, version: u64) -> Result<(), String
             // Programmer error, not user data: the coverage test catches it,
             // and release builds still fall back to a fresh default below.
             debug_assert!(false, "missing migration from config version {version}");
-            Err(format!("no migration from config version {version}"))
+            Err(anyhow::anyhow!("no migration from config version {version}"))
         }
     }
 }

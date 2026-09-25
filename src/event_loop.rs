@@ -1,9 +1,3 @@
-//! UI intent pump. Awaits UI intents, tray events, toast requests, and
-//! background job completions; the runtime otherwise sleeps. Intent handling
-//! is synchronous; channel resolves, update steps, and toasts wait in one
-//! `FuturesUnordered` polled by this same routine, so no task is ever
-//! spawned.
-
 use std::cell::RefCell;
 use std::future::Future;
 use std::path::PathBuf;
@@ -22,10 +16,10 @@ use crate::update;
 /// shown toast. All kinds share the queue; completions dispatch in
 /// [`EventLoop::handle_job`].
 enum JobDone {
-    ChannelResolved(String, Result<Vec<http::User>, http::Error>),
+    ChannelResolved(String, anyhow::Result<Option<http::User>>),
     UpdateCheckFinished,
     UpdateCheckDue,
-    UpdateDownloadFinished(Result<PathBuf, http::Error>),
+    UpdateDownloadFinished(anyhow::Result<PathBuf>),
     ToastShown,
 }
 /// One in-flight job. `!Send` is fine: everything stays on this one
@@ -140,8 +134,8 @@ impl EventLoop {
             UiIntent::AddLogin(login) => {
                 if let Some(login) = self.work.borrow_mut().begin_add_login(&login) {
                     self.jobs.push(Box::pin(async move {
-                        let users = http::fetch_users(&[], std::slice::from_ref(&login)).await;
-                        JobDone::ChannelResolved(login, users)
+                        let user = http::fetch_user(&login).await;
+                        JobDone::ChannelResolved(login, user)
                     }));
                 }
             }
