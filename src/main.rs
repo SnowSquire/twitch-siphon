@@ -15,17 +15,15 @@ mod tray;
 mod update;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
 
-use eframe::egui_wgpu;
-#[cfg(windows)]
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use wgpui::{App, Application, Bounds, QuitMode, WindowBounds, WindowOptions, px, size};
 
+use crate::app::{SiphonView, WindowParams};
 use crate::config::Config;
 use crate::event_loop::EventLoop;
 use crate::hermes::Session;
 use crate::state::{
-    FrameState, GuiWaker, SharedFrame, UiIntent, UpdateStatus, WorkContext, WorkState,
+    FrameState, GuiSender, SharedFrame, UiIntent, UpdateStatus, WorkContext, WorkState,
 };
 use crate::tray::TrayAction;
 
@@ -71,11 +69,10 @@ fn main() {
     );
 
     let (ui_tx, ui_rx) = kanal::unbounded::<UiIntent>();
-    let (tray_tx, tray_rx) = kanal::unbounded::<TrayAction>();
     let tray_events = tray::spawn_proxy();
-    let waker = GuiWaker::new();
+    let (gui_tx, gui_rx) = GuiSender::pair();
     // Latest-only snapshot slot shared by the work thread (writer) and the
-    // GUI thread (reader); the waker poke beside every store wakes the GUI.
+    // GUI thread (reader); the sender beside every store wakes the GUI.
     let frame = SharedFrame::new(FrameState {
         config: config.clone(),
         status: None,
@@ -84,11 +81,17 @@ fn main() {
     });
 
     //worker thread, runs hermes and event loop
-    let work_waker = waker.clone();
     let work_frame = frame.clone();
+    let wake_gui = gui_tx.clone();
+    #[cfg(windows)]
+    let theme_gui = gui_tx.clone();
     let _work_thread = std::thread::Builder::new()
         .name("worker thread".to_owned())
         .spawn(move || {
+            // System theme notifications land here: no new thread, and COM
+            // stays off the foreground thread's clipboard apartment.
+            #[cfg(windows)]
+            crate::app::watch_system_theme(theme_gui);
             {
                 compio::runtime::Runtime::new()
                     .expect("compio runtime")
@@ -100,9 +103,8 @@ fn main() {
                                 config,
                                 ui_rx,
                                 frame: work_frame,
-                                tray_tx,
                                 tray_events,
-                                waker: work_waker,
+                                gui: gui_tx,
                             },
                             session_tx,
                         )));
@@ -116,76 +118,48 @@ fn main() {
         })
         .expect("hermes thread");
 
-    // Spawns a thread
-    let wake = waker.clone();
+    // Second launches wake the window through the same gui channel the
+    // foreground pump awaits, so showing works even while hidden.
     let single = app_single_instance::start_primary(APP_ID, move || {
-        log::info!(target: "single", "wake signal received, waking event loop");
-        wake.repaint();
+        log::info!(target: "single", "wake signal received");
+        wake_gui.notify_tray(TrayAction::Show);
     });
 
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Siphon")
-        .with_app_id(APP_ID)
-        .with_inner_size([420.0, 520.0])
-        .with_min_inner_size([420.0, 520.0]);
-
-    match tray::load_icon_rgba() {
-        Ok((rgba, width, height)) => {
-            viewport = viewport.with_icon(Arc::new(egui::IconData {
-                rgba,
-                width,
-                height,
-            }));
-        }
-        Err(error) => log::info!(target: "app", "window icon unavailable: {error}"),
-    }
-
-    // Non-blocking presents. The Fifo/AutoVsync path stalls on the Windows
-    // flip path during a resize storm: the GUI thread keeps running but the
-    // compositor stops showing new frames, freezing the window. Mailbox is
-    // non-blocking like Immediate but paced to the display and tear-free.
-    // One frame in flight keeps the backlog bounded.
-
-    let run_result = eframe::run_native(
-        "Siphon",
-        eframe::NativeOptions {
-            viewport,
-            wgpu_options: egui_wgpu::WgpuConfiguration {
-                surface: eframe::SurfaceConfig {
-                    present_mode: wgpu::PresentMode::Mailbox,
-                    desired_maximum_frame_latency: Some(1),
-                },
+    Application::new().run(move |cx: &mut App| {
+        wgpui_kit::init(cx);
+        // The app lives in the tray with its window hidden; closing the
+        // last window must never end the event loop on its own.
+        cx.set_quit_mode(QuitMode::Explicit);
+        // Built here so every platform constructs it on the event-loop
+        // thread; the view owns it afterwards, and dropping removes it.
+        let tray = match tray::build() {
+            Ok(tray) => Some(tray),
+            Err(error) => {
+                log::error!(target: "tray", "tray build failed: {error}");
+                None
+            }
+        };
+        let params = WindowParams {
+            ui_tx,
+            shared: frame,
+            gui_rx,
+            tray,
+            single,
+        };
+        let bounds = Bounds::centered(None, size(px(420.), px(520.)), cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(420.), px(520.))),
+                app_id: Some(APP_ID.to_owned()),
                 ..Default::default()
             },
-            ..Default::default()
-        },
-        Box::new(move |cc| {
-            #[cfg(windows)]
-            let hwnd = cc
-                .window_handle()
-                .ok()
-                .and_then(|handle| match handle.as_raw() {
-                    RawWindowHandle::Win32(window) => Some(window.hwnd.get()),
-                    _ => None,
-                })
-                .ok_or("missing Win32 window handle")?;
-            let tray = match tray::build() {
-                Ok(tray) => Some(tray),
-                Err(error) => {
-                    log::error!(target: "tray", "tray build failed: {error}");
-                    None
-                }
-            };
-            waker.set(cc.egui_ctx.clone());
-            #[cfg(windows)]
-            let app = app::SiphonApp::new(ui_tx, frame, tray_rx, tray, single, hwnd);
-            #[cfg(not(windows))]
-            let app = app::SiphonApp::new(ui_tx, frame, tray_rx, tray, single);
-
-            Ok(Box::new(app) as Box<dyn eframe::App>)
-        }),
-    );
-    if let Err(error) = run_result {
-        log::info!(target: "app", "eframe exited with error: {error}");
-    }
+            move |window: &mut wgpui::Window, cx: &mut App| {
+                window.set_window_title("Siphon");
+                SiphonView::build(window, cx, params)
+            },
+        )
+        .expect("siphon window");
+        cx.activate(true);
+    });
 }

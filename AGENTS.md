@@ -10,7 +10,7 @@
 ## Architecture: GUI thread vs work thread
 
 - Entry: `src/main.rs`. GUI thread (`src/app.rs` `SiphonApp`, eframe/egui) is purely presentational: renders the latest `FrameState`, sends `UiIntent`s. All app state lives on one work thread as `Rc<RefCell<WorkState>>` (`src/state.rs`) running a compio thread-per-core runtime with `EventLoop::run()` + hermes `Session::run()` joined — no task is ever spawned (`src/event_loop.rs` polls GQL resolves via `FuturesUnordered`).
-- Cross-thread wire is only `kanal` channels plus `GuiWaker` (a repaint doorbell, not state): `UiIntent` GUI→work, `FrameState` snapshots work→GUI, `TrayAction` via `tray::spawn_proxy` thread. Channels alone can't wake winit — every `push_frame` must also poke the waker.
+- Cross-thread wire is only `kanal` channels: `UiIntent` GUI→work, `FrameState` snapshots plus `GuiEvent` (`Frame`/`Theme`/`Tray`) work→GUI through one `GuiSender`, `TrayAction` tray-proxy→work via `tray::spawn_proxy`.
 - compio is thread-per-core, so futures are intentionally `!Send` (`future_not_send` allow in `Cargo.toml`). Never hold a `RefCell` borrow across an `.await`: follow the `stage_*` (sync, under one short borrow) + `commit_save` (async, no borrow held) split in `state.rs`.
 - `Config::load` is sync and only for `main` before any runtime exists; on the work thread only use async `Config::save` (compio fs) so the runtime never blocks.
 - Tray (`src/tray.rs`): build inside the `run_native` creator closure (required thread affinity on Windows/macOS); the returned `Tray` value must stay alive (dropping removes the icon); `None` means close-to-quit instead of close-to-tray.

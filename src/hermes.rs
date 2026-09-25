@@ -813,7 +813,7 @@ impl Session {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::state::{GuiWaker, SharedFrame, WorkContext, WorkState};
+    use crate::state::{GuiSender, SharedFrame, WorkContext, WorkState};
 
     fn test_session(filtered_words: &[&str]) -> Session {
         let config = Config {
@@ -821,7 +821,6 @@ mod tests {
             ..Config::default()
         };
         let (_ui_tx, ui_rx) = kanal::unbounded();
-        let (tray_tx, _tray_rx) = kanal::unbounded();
         let (_tray_event_tx, tray_events) = kanal::unbounded();
         let (session_tx, command_rx) = kanal::unbounded();
         let work = Rc::new(RefCell::new(WorkState::new(
@@ -830,9 +829,8 @@ mod tests {
                 config,
                 ui_rx,
                 frame: SharedFrame::default(),
-                tray_tx,
                 tray_events,
-                waker: GuiWaker::new(),
+                gui: GuiSender::pair().0,
             },
             session_tx,
         )));

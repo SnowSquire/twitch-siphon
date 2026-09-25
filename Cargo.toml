@@ -10,27 +10,15 @@ edition = "2024"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-# UI + tray + single-instance: the standalone `tray-icon` crate is the same
-# code Tauri wraps, usable without Tauri (see tray-icon/examples/egui.rs).
-# `wgpu` renderer, Vulkan only: `wgpu_no_default_features` pulls the crates
-# with no backends, so the direct `wgpu` dep below is the sole backend
-# selector.
-eframe = { version = "0.36", default-features = false, features = [
-  "accesskit",
-  "default_fonts",
-  "links",
-  "wayland",
-  "wgpu_no_default_features",
-] }
-egui = "0.36"
+# UI: wgpui (retained, wgpu + winit) with the Kit component façade for inputs
+# and buttons. Backend selection follows wgpui's wgpu (Vulkan on
+# Windows/Linux, Metal on macOS); there is no backend pinning here.
+wgpui = "0.3.6"
+wgpui-kit = "0.6.1"
 # Sync+async MPMC channels bridging the GUI thread and the work runtime.
 kanal = "0.1"
-# Only for `select!` over the `tray-icon` global receivers, lowkey want to drop both this and tray-icon
-crossbeam-channel = "0.5"
-tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
 app-single-instance = "0.1"
 raw-window-handle = "0.6"
-image = { version = "0.25", default-features = false, features = ["png"] }
 dirs = "6"
 open = "5"
 env_logger = "0.11"
@@ -56,25 +44,30 @@ futures-util = { version = "0.3", default-features = false, features = [
   "async-await-macro",
 ] }
 log = "0.4"
-# Sole wgpu backend selector (see the eframe comment above).
-wgpu = { version = "30", default-features = false, features = [
-  "vulkan",
-  "vulkan-portability",
-] }
 
 
 [target."cfg(windows)".dependencies]
 winreg = "0.55"
 tauri-winrt-notification = "0.8"
-# Minimal Win32 surface for hide-to-tray (ShowWindow), per emilk/egui#737.
+# WinRT system theme notifications (no new threads: callbacks notify through
+# the existing gui sender from the system pool).
+windows = { version = "0.62", features = [
+  "Foundation",
+  "UI_ViewManagement",
+  "Win32_System_Com",
+] }
+
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
 
-# notify-rust only serves non-Windows toasts; keeping it out of the Windows
-# graph avoids its tauri-winrt-notification 0.7 chain pinning `windows` 0.61
-# while wgpu needs it unified on 0.62 (two copies break the DX12 backend).
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 notify-rust = { version = "4", features = ["async"] }
 
@@ -132,6 +125,6 @@ cast_possible_wrap = "allow"
 missing_panics_doc = "allow"
 
 [profile.release]
-lto = true
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
 strip = true

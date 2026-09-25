@@ -5,15 +5,16 @@
 //! else (config, persistence, the hermes session) inside [`WorkState`], which
 //! lives on that single thread. The GUI observes the latest snapshot through
 //! [`SharedFrame`]; the cross-thread primitives are the [`kanal`] queues
-//! below, that slot, and [`GuiWaker`], which is a doorbell, not state.
+//! below, that slot, and [`GuiSender`], the single work→GUI event sender.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 
 use kanal::{Receiver, Sender};
+use wgpui_kit::component::theme::ThemeMode;
 
 use crate::config::{Channel, Config};
 use crate::hermes;
@@ -71,9 +72,9 @@ pub struct FrameState {
 }
 
 /// Latest-only work→GUI snapshot slot. The work thread overwrites it on
-/// every change and pokes [`GuiWaker`]; the GUI thread copies it out when
-/// its seen version lags. Intermediate states vanish instead of queueing,
-/// so a stalled GUI never builds backlog.
+/// every change and notifies through [`GuiSender`]; the GUI thread copies
+/// it out when its seen version lags. Intermediate states vanish instead
+/// of queueing, so a stalled GUI never builds backlog.
 #[derive(Clone, Default)]
 pub struct SharedFrame {
     inner: Arc<RwLock<FrameState>>,
@@ -119,28 +120,49 @@ impl SharedFrame {
     }
 }
 
-/// The single remaining shared primitive: a wake handle, not app state.
-/// Set once by the GUI thread; poked by the work thread after every push so
-/// a hidden or idle event loop notices. Channels alone cannot wake winit.
-#[derive(Clone)]
-pub struct GuiWaker {
-    ctx: Arc<OnceLock<egui::Context>>,
+/// Work→GUI events sharing one channel to the foreground pump. `Frame`
+/// means the snapshot slot holds something newer; `Theme` carries the mode
+/// the system watcher reported; `Tray` carries a tray or single-instance
+/// action. Frame events are idempotent: the pump skips the clone when its
+/// seen version is current, so duplicates are harmless, and tray handling
+/// reloads the frame too.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GuiEvent {
+    Frame,
+    Theme(ThemeMode),
+    Tray(TrayAction),
 }
 
-impl GuiWaker {
-    pub fn new() -> Self {
-        Self {
-            ctx: Arc::new(OnceLock::new()),
+/// The single work→GUI sender: one unbounded queue the foreground pump
+/// awaits. Unbounded because tray actions are lossless; frame traffic is
+/// user actions and connection events, never a hot loop, so no backlog
+/// builds in practice.
+#[derive(Clone)]
+pub struct GuiSender {
+    tx: Sender<GuiEvent>,
+}
+
+impl GuiSender {
+    pub fn pair() -> (Self, kanal::AsyncReceiver<GuiEvent>) {
+        let (tx, rx) = kanal::unbounded();
+        (Self { tx }, rx.to_async())
+    }
+
+    pub fn notify_frame(&self) {
+        if self.tx.send(GuiEvent::Frame).is_err() {
+            log::info!(target: "app", "gui channel closed");
         }
     }
 
-    pub fn set(&self, ctx: egui::Context) {
-        let _ = self.ctx.set(ctx);
+    pub fn notify_theme(&self, mode: ThemeMode) {
+        if self.tx.send(GuiEvent::Theme(mode)).is_err() {
+            log::info!(target: "app", "gui channel closed");
+        }
     }
 
-    pub fn repaint(&self) {
-        if let Some(ctx) = self.ctx.get() {
-            ctx.request_repaint();
+    pub fn notify_tray(&self, action: TrayAction) {
+        if self.tx.send(GuiEvent::Tray(action)).is_err() {
+            log::info!(target: "app", "gui channel closed");
         }
     }
 }
@@ -153,9 +175,8 @@ pub struct WorkContext {
     pub config: Config,
     pub ui_rx: Receiver<UiIntent>,
     pub frame: SharedFrame,
-    pub tray_tx: Sender<TrayAction>,
     pub tray_events: Receiver<TrayAction>,
-    pub waker: GuiWaker,
+    pub gui: GuiSender,
 }
 
 /// All mutable app state, owned by the work thread alone. Every method is
@@ -171,9 +192,8 @@ pub struct WorkState {
     session_tx: Sender<hermes::Command>,
     pub(crate) ui_rx: kanal::AsyncReceiver<UiIntent>,
     frame: SharedFrame,
-    tray_tx: Sender<TrayAction>,
     pub(crate) tray_events: kanal::AsyncReceiver<TrayAction>,
-    waker: GuiWaker,
+    gui: GuiSender,
     pub(crate) pending_adds: Arc<RwLock<Vec<String>>>,
 }
 
@@ -194,10 +214,9 @@ impl WorkState {
             session_tx,
             ui_rx: ctx.ui_rx.to_async(),
             frame: ctx.frame,
-            tray_tx: ctx.tray_tx,
             tray_events: ctx.tray_events.to_async(),
             pending_adds: Arc::new(RwLock::new(Vec::new())),
-            waker: ctx.waker,
+            gui: ctx.gui,
         }
     }
 
@@ -216,8 +235,7 @@ impl WorkState {
     }
 
     pub fn forward_tray(&self, action: TrayAction) {
-        let _ = self.tray_tx.send(action);
-        self.wake();
+        self.gui.notify_tray(action);
     }
 
     /// Validates an add request. Returns the normalized login when a resolve
@@ -594,11 +612,7 @@ impl WorkState {
             error: self.error.clone(),
             update: self.update.clone(),
         });
-        self.wake();
-    }
-
-    fn wake(&self) {
-        self.waker.repaint();
+        self.gui.notify_frame();
     }
 }
 
@@ -624,7 +638,6 @@ mod tests {
         path: PathBuf,
     ) -> (Rc<RefCell<WorkState>>, Receiver<hermes::Command>) {
         let (_ui_tx, ui_rx) = kanal::unbounded();
-        let (tray_tx, _tray_rx) = kanal::unbounded();
         let (_tray_event_tx, tray_events) = kanal::unbounded();
         let (session_tx, session_rx) = kanal::unbounded();
         let work = Rc::new(RefCell::new(WorkState::new(
@@ -633,9 +646,8 @@ mod tests {
                 config,
                 ui_rx,
                 frame: SharedFrame::new(FrameState::default()),
-                tray_tx,
                 tray_events,
-                waker: GuiWaker::new(),
+                gui: GuiSender::pair().0,
             },
             session_tx,
         )));
@@ -738,7 +750,6 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("siphon-state-typo-{}.json", std::process::id()));
         let shared = SharedFrame::new(FrameState::default());
-        let (tray_tx, _tray_rx) = kanal::unbounded();
         let (_ui_tx, ui_rx) = kanal::unbounded();
         let (_tray_event_tx, tray_events) = kanal::unbounded();
         let (session_tx, session_rx) = kanal::unbounded();
@@ -748,9 +759,8 @@ mod tests {
                 config: Config::default(),
                 ui_rx,
                 frame: shared.clone(),
-                tray_tx,
                 tray_events,
-                waker: GuiWaker::new(),
+                gui: GuiSender::pair().0,
             },
             session_tx,
         )));
@@ -784,7 +794,6 @@ mod tests {
             ..Config::default()
         };
         let shared = SharedFrame::new(FrameState::default());
-        let (tray_tx, _tray_rx) = kanal::unbounded();
         let (_ui_tx, ui_rx) = kanal::unbounded();
         let (_tray_event_tx, tray_events) = kanal::unbounded();
         let (session_tx, _session_rx) = kanal::unbounded::<hermes::Command>();
@@ -794,9 +803,8 @@ mod tests {
                 config,
                 ui_rx,
                 frame: shared.clone(),
-                tray_tx,
                 tray_events,
-                waker: GuiWaker::new(),
+                gui: GuiSender::pair().0,
             },
             session_tx,
         )));

@@ -17,7 +17,7 @@ use crate::http;
 ///
 /// the check is cheap and a restart re-checks anyway.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
-const RELEASES_URL: &str = "http://127.0.0.1:18427/releases/latest";
+const RELEASES_URL: &str = "https://api.github.com/repos/SnowSquire/twitch-siphon/releases/latest";
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Registry key the WiX installer records the install dir under
 /// (`packaging/wix/main.wxs` writes `HKCU\Software\Ozeniken\Siphon`).
