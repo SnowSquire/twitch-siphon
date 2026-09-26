@@ -41,7 +41,10 @@ compio = { version = "0.19", features = [
 # `rustls` is `rustls-platform-verifier`, and compio-ws gets the same
 # verifier instead of the Mozilla bundle, so `native-tls` (SChannel/OpenSSL)
 # is out of our subgraph. cyper defaults stay off: its default is `native-tls`.
-cyper = { version = "0.9", default-features = false, features = ["stream", "rustls"] }
+cyper = { version = "0.9", default-features = false, features = [
+  "stream",
+  "rustls",
+] }
 futures-util = { version = "0.3", default-features = false, features = [
   "std",
   "async-await-macro",
@@ -121,6 +124,6 @@ cast_possible_wrap = "allow"
 missing_panics_doc = "allow"
 
 [profile.release]
-lto = "thin"
-codegen-units = 16
+lto = "fat"
+codegen-units = 1
 strip = true

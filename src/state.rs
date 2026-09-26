@@ -1,32 +1,36 @@
 //! GUI↔work wire protocol and work-thread state.
 //!
 //! The GUI thread is purely presentational: it renders the latest
-//! [`FrameState`] and sends [`UiIntent`]s. The work thread owns everything
-//! else (config, persistence, the hermes session) inside [`WorkState`], which
-//! lives on that single thread. The GUI observes the latest snapshot through
-//! [`SharedFrame`]; the cross-thread primitives are the [`kanal`] queues
-//! below, that slot, and [`GuiSender`], the single work→GUI event sender.
+//! [`AppState`] and sends [`UiIntent`]s. The work thread owns a [`Worker`]:
+//! presentation state lives in [`SharedFrame`] (the one slot the GUI reads),
+//! everything else (connection, subscriptions, background jobs) is private
+//! to the work thread. Each [`SharedFrame::update`] wakes the foreground
+//! pump through the same channel, so state and wakeup never drift apart.
 
-use std::cell::RefCell;
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::collections::HashMap;
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
-use kanal::{Receiver, Sender};
+use futures_util::stream::FuturesUnordered;
+use kanal::Sender;
 use wgpui_kit::component::theme::ThemeMode;
 
-use crate::config::{Channel, Config};
-use crate::hermes;
+use crate::balesh::{CheapRng, Topic};
+use crate::config::Config;
+use crate::hermes::{Sub, WsStream};
 use crate::http;
-use crate::notifier::ToastJob;
+use crate::matcher::Matcher;
+use crate::notifier;
 use crate::tray::TrayAction;
-use crate::update;
 
-/// One imperative UI mutation. Sent GUI→work instead of diffing whole
-/// settings snapshots; the work thread persists, forwards to hermes, and
-/// pushes a fresh [`FrameState`] back. Adds carry only the login (the only
-/// thing the UI knows); removes carry the resolved id.
+/// One imperative UI mutation. Sent GUI→work; the work thread applies it,
+/// persists it as a background job, and publishes a fresh [`AppState`].
+/// Adds carry only the login (the only thing the UI knows); removes carry
+/// the resolved id.
 pub enum UiIntent {
     AddLogin(String),
     RemoveChannel(u64),
@@ -61,72 +65,116 @@ pub struct AvailableUpdate {
     pub page_url: String,
 }
 
-/// Everything the GUI needs for one frame. Overwritten work→GUI on every
-/// change; the GUI copies it out when its seen version lags. All fields are
-/// `Clone` so the snapshot crosses the slot by value.
+/// One channel's subscription state for the GUI row, plus the resolved
+/// detail the expanded row shows.
+#[derive(Clone)]
+pub struct ChannelStatus {
+    pub channel_id: u64,
+    pub login: String,
+    pub display_name: String,
+    pub title_status: SubStatus,
+    pub live_status: SubStatus,
+    pub stream_id: u64,
+    pub stream_title: Option<String>,
+    /// Milliseconds since the unix epoch; `None` when offline.
+    pub stream_start: Option<i64>,
+    pub viewers: Option<u32>,
+    pub collaboration_viewers: Option<u32>,
+    pub game: Option<String>,
+    pub game_id: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+pub enum SubStatus {
+    Pending,
+    Connected,
+    Failed,
+}
+
+/// Everything the GUI needs for one frame. This is the single source of
+/// truth for presentation state: the work thread mutates it under short
+/// write locks (never held across an `await`) and the GUI clones it out
+/// when its seen version lags.
 #[derive(Clone, Default)]
-pub struct FrameState {
+pub struct AppState {
     pub config: Config,
-    pub status: Option<hermes::StatusSnapshot>,
+    pub connected: bool,
+    pub conn_error: Option<String>,
+    pub channels: Vec<ChannelStatus>,
+    pub pending: Vec<String>,
     pub error: String,
     pub update: UpdateStatus,
 }
 
-/// Latest-only work→GUI snapshot slot. The work thread overwrites it on
-/// every change and notifies through [`GuiSender`]; the GUI thread copies
-/// it out when its seen version lags. Intermediate states vanish instead
-/// of queueing, so a stalled GUI never builds backlog.
-#[derive(Clone, Default)]
+/// Latest-only work→GUI snapshot slot. The work thread mutates it in place
+/// on every change; each mutation wakes the foreground pump through the
+/// bundled channel, so state and wakeup never drift apart. The GUI thread
+/// clones the snapshot out when its seen version lags. Intermediate states
+/// vanish instead of queueing, so a stalled GUI never builds backlog.
+/// The channel is unbounded because tray actions are lossless; frame
+/// traffic is user actions and connection events, never a hot loop, so no
+/// backlog builds in practice.
+#[derive(Clone)]
 pub struct SharedFrame {
-    inner: Arc<RwLock<FrameState>>,
+    inner: Arc<RwLock<AppState>>,
     version: Arc<AtomicU64>,
+    tx: Sender<GuiEvent>,
 }
 
 impl SharedFrame {
-    pub fn new(frame: FrameState) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(frame)),
-            version: Arc::new(AtomicU64::new(0)),
-        }
+    /// Creates the slot plus the pump wakeups: the receiver belongs to the
+    /// foreground pump awaiting [`GuiEvent`]s.
+    pub fn pair(state: AppState) -> (Self, kanal::AsyncReceiver<GuiEvent>) {
+        let (tx, rx) = kanal::unbounded();
+        (
+            Self {
+                inner: Arc::new(RwLock::new(state)),
+                version: Arc::new(AtomicU64::new(0)),
+                tx,
+            },
+            rx.to_async(),
+        )
     }
 
-    /// Overwrites the slot and marks it newer. A poisoned lock still takes
-    /// the write; the snapshot matters more than the panic that poisoned it.
-    pub fn store(&self, frame: FrameState) {
-        *self
-            .inner
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner()) = frame;
+    /// Mutates the slot in place, marks it newer, and wakes the pump.
+    /// Short critical sections only: never hold the guard across an
+    /// `await`. A poisoned lock still applies the write; the snapshot
+    /// matters more than the panic that poisoned it. Wakeups are
+    /// idempotent: the pump skips the clone when its seen version is
+    /// current, so duplicates are harmless.
+    pub fn update(&self, apply: impl FnOnce(&mut AppState)) {
+        apply(
+            &mut self
+                .inner
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        );
         self.version.fetch_add(1, Ordering::Release);
+        self.send(GuiEvent::Frame);
     }
 
-    /// Copies the whole snapshot plus its version.
-    pub fn load(&self) -> (FrameState, u64) {
-        let frame = self
-            .inner
+    /// Borrows the slot. Short critical sections only: never hold the
+    /// guard across an `await` (clippy's `await_holding_lock` enforces
+    /// this). A poisoned lock still reads; the snapshot matters more than
+    /// the panic that poisoned it.
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, AppState> {
+        self.inner
             .read()
-            .map(|slot| slot.clone())
-            .unwrap_or_else(|poison| poison.into_inner().clone());
-        (frame, self.version.load(Ordering::Acquire))
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    /// Copies the snapshot only when it is newer than `seen`, so idle
-    /// passes skip the clone. A store racing the check surfaces on the
-    /// next pass via the waker poke that accompanies every store.
-    pub fn load_newer(&self, seen: u64) -> Option<(FrameState, u64)> {
-        if self.version.load(Ordering::Acquire) == seen {
-            return None;
-        }
-        Some(self.load())
+    /// Current version, bumped by every [`SharedFrame::update`]. The pump
+    /// skips the clone when its seen version is current; a store racing
+    /// the check surfaces on the next pass via the accompanying poke.
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
     }
 }
 
-/// Work→GUI events sharing one channel to the foreground pump. `Frame`
-/// means the snapshot slot holds something newer; `Theme` carries the mode
-/// the system watcher reported; `Tray` carries a tray or single-instance
-/// action. Frame events are idempotent: the pump skips the clone when its
-/// seen version is current, so duplicates are harmless, and tray handling
-/// reloads the frame too.
+/// Work→GUI events sharing the [`SharedFrame`] channel to the foreground
+/// pump. `Frame` means the snapshot slot holds something newer; `Theme`
+/// carries the mode the system watcher reported; `Tray` carries a tray or
+/// single-instance action. Tray handling reloads the frame too.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GuiEvent {
     Frame,
@@ -134,523 +182,230 @@ pub enum GuiEvent {
     Tray(TrayAction),
 }
 
-/// The single work→GUI sender: one unbounded queue the foreground pump
-/// awaits. Unbounded because tray actions are lossless; frame traffic is
-/// user actions and connection events, never a hot loop, so no backlog
-/// builds in practice.
-#[derive(Clone)]
-pub struct GuiSender {
-    tx: Sender<GuiEvent>,
-}
-
-impl GuiSender {
-    pub fn pair() -> (Self, kanal::AsyncReceiver<GuiEvent>) {
-        let (tx, rx) = kanal::unbounded();
-        (Self { tx }, rx.to_async())
-    }
-
-    pub fn notify_frame(&self) {
-        if self.tx.send(GuiEvent::Frame).is_err() {
+impl SharedFrame {
+    fn send(&self, event: GuiEvent) {
+        if self.tx.send(event).is_err() {
             log::info!(target: "app", "gui channel closed");
         }
     }
 
-    pub fn notify_theme(&self, mode: ThemeMode) {
-        if self.tx.send(GuiEvent::Theme(mode)).is_err() {
-            log::info!(target: "app", "gui channel closed");
-        }
-    }
-
+    /// Forwards a tray or single-instance action to the foreground pump.
     pub fn notify_tray(&self, action: TrayAction) {
-        if self.tx.send(GuiEvent::Tray(action)).is_err() {
-            log::info!(target: "app", "gui channel closed");
-        }
+        self.send(GuiEvent::Tray(action));
+    }
+
+    /// Forwards a system theme report to the foreground pump.
+    pub fn notify_theme(&self, mode: ThemeMode) {
+        self.send(GuiEvent::Theme(mode));
     }
 }
 
-/// Everything the work thread needs at startup. Moved in whole; the channel
-/// ends are then owned by the runtime tasks, the snapshot slot is shared
-/// with the GUI thread.
-pub struct WorkContext {
+/// One finished background job: a channel resolve, a persisted save, a
+/// queued toast, a shown toast, an update step, or a connection attempt.
+/// All kinds share the queue; completions dispatch in `handle_job`, which
+/// applies them to the [`Worker`] with plain `&mut` access.
+pub(crate) enum JobDone {
+    AddResolved(String, anyhow::Result<Option<http::ResolvedChannel>>),
+    LiveRefreshed(u64, anyhow::Result<Vec<http::ResolvedChannel>>),
+    SaveFinished(anyhow::Result<()>),
+    ToastShown,
+    UpdateCheckFinished(anyhow::Result<crate::update::Release>),
+    UpdateCheckDue,
+    UpdateDownloadFinished(anyhow::Result<PathBuf>),
+    ConnectFinished(Box<ConnectOutcome>),
+}
+
+/// Outcome of one connection attempt: the fresh baseline (with the ids
+/// that no longer resolve) plus the live socket, if the handshake
+/// succeeded. Failures reconnect with whatever the sync established.
+pub(crate) enum ConnectOutcome {
+    Connected {
+        channels: Vec<http::ResolvedChannel>,
+        missing: Vec<u64>,
+        socket: Option<WsStream>,
+    },
+}
+
+/// One in-flight job. `!Send` is fine: everything stays on the single
+/// thread-per-core runtime thread.
+pub(crate) type JobFuture = Pin<Box<dyn Future<Output = JobDone>>>;
+
+/// Everything the work thread needs at startup. Moved in whole; the
+/// channel ends are then owned by the run loop, the snapshot slot is
+/// shared with the GUI thread.
+pub struct WorkerParams {
     pub config_path: PathBuf,
     pub config: Config,
-    pub ui_rx: Receiver<UiIntent>,
-    pub frame: SharedFrame,
-    pub tray_events: Receiver<TrayAction>,
-    pub toast_tx: Sender<ToastJob>,
-    pub gui: GuiSender,
+    pub ui_rx: kanal::Receiver<UiIntent>,
+    pub tray_rx: kanal::Receiver<TrayAction>,
+    pub shared: SharedFrame,
 }
-
-/// All mutable app state, owned by the work thread alone. Every method is
-/// plain single-threaded code; tasks on the runtime share it through
-/// `Rc<RefCell<WorkState>>` with short scoped borrows, never held across
-/// an `await`.
-pub struct WorkState {
-    config_path: Rc<PathBuf>,
-    config: Rc<Config>,
-    error: String,
-    status: Option<hermes::StatusSnapshot>,
-    update: UpdateStatus,
-    session_tx: Sender<hermes::Command>,
+/// All mutable work-thread state, owned by the single work thread. The
+/// `shared` slot is the presentation source of truth (the GUI holds a
+/// clone of its `Arc`); every other field is private to this thread.
+/// `handle_job`/`handle_intent` mutate with plain `&mut self`: jobs carry
+/// owned results back instead of sharing borrows, and locks are never
+/// held across an `await`.
+pub struct Worker {
+    pub(crate) config_path: PathBuf,
+    pub(crate) shared: SharedFrame,
     pub(crate) ui_rx: kanal::AsyncReceiver<UiIntent>,
-    frame: SharedFrame,
-    pub(crate) tray_events: kanal::AsyncReceiver<TrayAction>,
-    pub(crate) toast_tx: Sender<ToastJob>,
-    gui: GuiSender,
-    pub(crate) pending_adds: Arc<RwLock<Vec<String>>>,
+    pub(crate) tray_rx: kanal::AsyncReceiver<TrayAction>,
+    pub(crate) channels: HashMap<u64, http::ResolvedChannel>,
+    pub(crate) subs: HashMap<Topic, Sub>,
+    pub(crate) matcher: Matcher,
+    pub(crate) socket: Option<WsStream>,
+    pub(crate) welcomed: bool,
+    pub(crate) connecting: bool,
+    pub(crate) keepalive_secs: u64,
+    pub(crate) last_message: Instant,
+    pub(crate) reconnect_at: Instant,
+    pub(crate) reconnect_attempt: u32,
+    pub(crate) rng: CheapRng,
+    pub(crate) jobs: FuturesUnordered<JobFuture>,
 }
 
-struct PendingSave {
-    path: Rc<PathBuf>,
-    config: Rc<Config>,
-    forward: hermes::Command,
-}
+impl Worker {
+    pub fn new(params: WorkerParams) -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
 
-impl WorkState {
-    pub fn new(ctx: WorkContext, session_tx: Sender<hermes::Command>) -> Self {
-        Self {
-            config_path: Rc::new(ctx.config_path),
-            config: Rc::new(ctx.config),
-            error: String::new(),
-            status: None,
-            update: UpdateStatus::Idle,
-            session_tx,
-            ui_rx: ctx.ui_rx.to_async(),
-            frame: ctx.frame,
-            tray_events: ctx.tray_events.to_async(),
-            toast_tx: ctx.toast_tx,
-            pending_adds: Arc::new(RwLock::new(Vec::new())),
-            gui: ctx.gui,
-        }
-    }
-
-    pub fn clear_error(&mut self) {
-        self.error.clear();
-        self.push_frame();
-    }
-
-    pub fn config_snapshot(&self) -> Rc<Config> {
-        Rc::clone(&self.config)
-    }
-
-    pub fn set_status(&mut self, status: hermes::StatusSnapshot) {
-        self.status = Some(status);
-        self.push_frame();
-    }
-
-    pub fn forward_tray(&self, action: TrayAction) {
-        self.gui.notify_tray(action);
-    }
-
-    pub fn begin_add_login(&mut self, login: &str) -> Option<String> {
-        let login = login.trim().to_lowercase();
-        if login.is_empty()
-            || self
-                .config
-                .channels
-                .iter()
-                .any(|channel| channel.login.eq_ignore_ascii_case(&login))
-        {
-            return None;
-        }
-        if let Ok(pending) = self.pending_adds.read()
-            && pending.iter().any(|item| item.eq_ignore_ascii_case(&login))
-        {
-            return None;
-        }
-        if let Ok(mut v) = self.pending_adds.write() {
-            v.push(login.clone());
-        }
-        self.error.clear();
-        self.push_frame();
-        Some(login)
-    }
-
-    /// Applies a finished resolve: resolved channels persist to disk, unknown
-    /// logins never enter the list and surface an error instead. Takes
-    /// `work` instead of `&mut self` so the `RefCell` borrow is never held
-    /// across the disk write's await.
-    pub async fn finish_add_login(
-        work: &Rc<RefCell<Self>>,
-        login: String,
-        result: anyhow::Result<Option<http::User>>,
-    ) {
-        let pending = work.borrow_mut().stage_finish_add_login(&login, result);
-        let finished_without_save = pending.is_none();
-        Self::commit_save(work, pending).await;
-        if finished_without_save {
-            work.borrow().push_frame();
-        }
-    }
-
-    pub async fn apply_remove_channel(work: &Rc<RefCell<Self>>, id: u64) {
-        let pending = work.borrow_mut().stage_remove_channel(id);
-        Self::commit_save(work, Some(pending)).await;
-    }
-
-    /// Drops ids the session found unresolvable (deleted/renamed): they
-    /// disappear from the persisted list with an error, instead of lingering.
-    pub async fn apply_prune_ids(work: &Rc<RefCell<Self>>, ids: &[u64]) {
-        let staged = work.borrow_mut().stage_prune_ids(ids);
-        let Some((path, config)) = staged else { return };
-        match config.save(&path).await {
-            Ok(()) => {
-                work.borrow_mut()
-                    .set_error("a channel no longer resolves and was removed");
-            }
-            Err(error) => work.borrow_mut().set_error(error.to_string()),
-        }
-    }
-
-    /// Drops one login the session found unresolvable: it disappears from
-    /// the persisted list (if present) and surfaces an error.
-    pub async fn apply_prune_login(work: &Rc<RefCell<Self>>, login: &str) {
-        let staged = work.borrow_mut().stage_prune_login(login);
-        let Some((path, config)) = staged else {
-            work.borrow_mut()
-                .set_error(format!("channel {login} not found"));
-            return;
+        let matcher = crate::hermes::build_matcher(&params.config.filtered_words);
+        let worker = Self {
+            config_path: params.config_path,
+            shared: params.shared,
+            ui_rx: params.ui_rx.to_async(),
+            tray_rx: params.tray_rx.to_async(),
+            channels: HashMap::new(),
+            subs: HashMap::new(),
+            matcher,
+            socket: None,
+            welcomed: false,
+            connecting: false,
+            keepalive_secs: 15,
+            last_message: Instant::now(),
+            reconnect_at: Instant::now(),
+            reconnect_attempt: 0,
+            rng: CheapRng::new(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0x853c_49e6_748f_ea9b, |elapsed| elapsed.as_nanos() as u64),
+            ),
+            jobs: FuturesUnordered::new(),
         };
-        match config.save(&path).await {
-            Ok(()) => {
-                work.borrow_mut()
-                    .set_error(format!("channel {login} not found"));
-            }
-            Err(error) => work.borrow_mut().set_error(error.to_string()),
-        }
-    }
-
-    pub async fn apply_notify_title_changes(work: &Rc<RefCell<Self>>, value: bool) {
-        let pending = work.borrow_mut().stage_notify_title_changes(value);
-        Self::commit_save(work, Some(pending)).await;
-    }
-
-    pub async fn apply_sound(work: &Rc<RefCell<Self>>, value: bool) {
-        let pending = work.borrow_mut().stage_sound(value);
-        Self::commit_save(work, Some(pending)).await;
-    }
-
-    pub async fn apply_add_filtered_word(work: &Rc<RefCell<Self>>, word: String) {
-        let pending = work.borrow_mut().stage_add_filtered_word(&word);
-        Self::commit_save(work, pending).await;
-    }
-
-    pub async fn apply_remove_filtered_word(work: &Rc<RefCell<Self>>, index: usize) {
-        let pending = work.borrow_mut().stage_remove_filtered_word(index);
-        Self::commit_save(work, pending).await;
-    }
-
-    /// Polls the latest release and offers it when newer. Skipped while a
-    /// check or download is already in flight. A failed check goes back to
-    /// idle silently (it retries on the next interval); only a
-    /// user-triggered download failure surfaces an error.
-    pub async fn check_for_update(work: &Rc<RefCell<Self>>) {
-        if matches!(
-            work.borrow().update,
-            UpdateStatus::Checking | UpdateStatus::Downloading(_)
-        ) {
-            return;
-        }
-        work.borrow_mut().update = UpdateStatus::Checking;
-        work.borrow().push_frame();
-        // No borrow held across the fetch: the result is applied below.
-        let result = update::fetch_latest().await;
-        let mut state = work.borrow_mut();
-        match result {
-            Ok(release) => {
-                state.update = if update::newer_than_current(&release) {
-                    log::info!(target: "update", "new release: {}", release.version);
-                    UpdateStatus::Available(AvailableUpdate {
-                        version: release.version.to_string(),
-                        msi_url: release.msi_url,
-                        page_url: release.page_url,
-                    })
-                } else {
-                    UpdateStatus::Current
-                };
-            }
-            Err(error) => {
-                log::info!(target: "update", "check failed: {error}");
-                state.update = UpdateStatus::Idle;
-            }
-        }
-        state.push_frame();
-    }
-
-    /// Starts applying the offered update. Yields the offer only from the
-    /// `Available` state, so double clicks and stale intents are ignored.
-    pub fn begin_update(&mut self) -> Option<AvailableUpdate> {
-        let info = match &self.update {
-            UpdateStatus::Available(info) => info.clone(),
-            _ => return None,
-        };
-        self.update = UpdateStatus::Downloading(info.clone());
-        self.push_frame();
-        Some(info)
-    }
-
-    /// Opens the release page for builds with no installer handoff
-    /// (portable builds, or a release without an installer asset). The
-    /// offer stays: the button remains until a newer check replaces it.
-    pub fn finish_update_page(&mut self, info: &AvailableUpdate) {
-        self.update = UpdateStatus::Available(info.clone());
-        if let Err(error) = open::that(&info.page_url) {
-            self.set_error(format!("couldn't open {}: {error}", info.page_url));
-        } else {
-            self.push_frame();
-        }
-    }
-
-    /// Applies a finished installer download: launches the updater and
-    /// quits so no files are locked; the updater reopens the app once the
-    /// install finishes. Failures revert to the offer with an error, so
-    /// the button retries.
-    pub fn finish_update_download(&mut self, result: anyhow::Result<PathBuf>) {
-        let info = match &self.update {
-            UpdateStatus::Downloading(info) => info.clone(),
-            _ => return,
-        };
-        match result {
-            Ok(path) => match launch_installer(&path) {
-                Ok(()) => {
-                    log::info!(target: "update", "updater launched, quitting for upgrade");
-                    self.forward_tray(TrayAction::Quit);
-                }
-                Err(error) => {
-                    self.update = UpdateStatus::Available(info);
-                    self.set_error(format!("couldn't launch installer: {error}"));
-                }
-            },
-            Err(error) => {
-                self.update = UpdateStatus::Available(info);
-                self.set_error(format!("update download failed: {error}"));
-            }
-        }
-    }
-
-    fn stage_save(&mut self, forward: hermes::Command) -> PendingSave {
-        Rc::make_mut(&mut self.config).version = Config::VERSION;
-        PendingSave {
-            path: Rc::clone(&self.config_path),
-            config: Rc::clone(&self.config),
-            forward,
-        }
-    }
-
-    /// Shared tail of every persisting intent: writes the snapshot with no
-    /// borrow held, then forwards + frames on success or surfaces the error.
-    async fn commit_save(work: &Rc<RefCell<Self>>, pending: Option<PendingSave>) {
-        let Some(save) = pending else { return };
-        match save.config.save(&save.path).await {
-            Ok(()) => {
-                let work = work.borrow();
-                work.forward(save.forward);
-                work.push_frame();
-            }
-            Err(error) => work.borrow_mut().set_error(error.to_string()),
-        }
-    }
-
-    /// Synchronous in-memory half of [`Self::finish_add_login`]: mutates and
-    /// snapshots under one short borrow, leaving the disk write to
-    /// [`Self::commit_save`]. Paths that persist nothing (duplicates finish
-    /// silently, unknown logins surface an error) yield `None`.
-    fn stage_finish_add_login(
-        &mut self,
-        login: &str,
-        result: anyhow::Result<Option<http::User>>,
-    ) -> Option<PendingSave> {
-        match result {
-            Ok(Some(user)) => {
-                if let Ok(mut v) = self.pending_adds.write() {
-                    v.retain(|item| !item.eq_ignore_ascii_case(login));
-                }
-
-                log::info!(
-                    target: "config",
-                    "resolved {} to id {} ({})",
-                    login,
-                    user.channel_id,
-                    user.channel_display_name
-                );
-                if self
-                    .config
-                    .channels
-                    .iter()
-                    .any(|existing| existing.id == user.channel_id)
-                {
-                    return None;
-                }
-                let channel = Channel {
-                    login: user.channel_name.clone(),
-                    id: user.channel_id,
-                    display_name: Some(user.channel_display_name),
-                };
-                let forward_login = channel.login.clone();
-                Rc::make_mut(&mut self.config).channels.push(channel);
-                Some(self.stage_save(hermes::Command::AddChannel(forward_login)))
-            }
-            Ok(None) => {
-                if let Ok(mut v) = self.pending_adds.write() {
-                    v.retain(|item| !item.eq_ignore_ascii_case(login));
-                }
-                log::info!(
-                    target: "config",
-                    "gql returned no channel named {login}, is it a typo?"
-                );
-                self.set_error(format!("channel {login} not found"));
-                None
-            }
-            Err(error) => {
-                if let Ok(mut v) = self.pending_adds.write() {
-                    v.retain(|item| !item.eq_ignore_ascii_case(login));
-                }
-                log::info!(target: "config", "channel resolution failed: {error}");
-                self.set_error(format!("failed to resolve {login}: {error}"));
-                None
-            }
-        }
-    }
-
-    fn stage_remove_channel(&mut self, id: u64) -> PendingSave {
-        Rc::make_mut(&mut self.config)
-            .channels
-            .retain(|channel| channel.id != id);
-        self.stage_save(hermes::Command::RemoveChannel(id))
-    }
-
-    /// Synchronous in-memory half of [`Self::apply_prune_ids`]: removes any
-    /// persisted channels whose ids are gone, snapshots for the write. Yields
-    /// `None` when nothing changed, so no disk touch happens.
-    fn stage_prune_ids(&mut self, ids: &[u64]) -> Option<(Rc<PathBuf>, Rc<Config>)> {
-        let before = self.config.channels.len();
-        Rc::make_mut(&mut self.config)
-            .channels
-            .retain(|channel| !ids.contains(&channel.id));
-        if self.config.channels.len() == before {
-            return None;
-        }
-        Rc::make_mut(&mut self.config).version = Config::VERSION;
-        Some((Rc::clone(&self.config_path), Rc::clone(&self.config)))
-    }
-
-    /// Synchronous in-memory half of [`Self::apply_prune_login`]: removes
-    /// any persisted channel with this login. Yields `None` when nothing
-    /// changed (the login was never persisted, e.g. a typo add).
-    fn stage_prune_login(&mut self, login: &str) -> Option<(Rc<PathBuf>, Rc<Config>)> {
-        let before = self.config.channels.len();
-        Rc::make_mut(&mut self.config)
-            .channels
-            .retain(|channel| !channel.login.eq_ignore_ascii_case(login));
-        if self.config.channels.len() == before {
-            return None;
-        }
-        Rc::make_mut(&mut self.config).version = Config::VERSION;
-        Some((Rc::clone(&self.config_path), Rc::clone(&self.config)))
-    }
-
-    fn stage_notify_title_changes(&mut self, value: bool) -> PendingSave {
-        Rc::make_mut(&mut self.config).notify_title_changes = value;
-        self.stage_save(hermes::Command::SetNotifyTitleChanges(value))
-    }
-
-    fn stage_sound(&mut self, value: bool) -> PendingSave {
-        Rc::make_mut(&mut self.config).sound = value;
-        self.stage_save(hermes::Command::SetSound(value))
-    }
-
-    /// Synchronous in-memory half of [`Self::apply_add_filtered_word`]:
-    /// trims and dedupes (case-insensitive, matching the matcher's folding)
-    /// under one short borrow. Yields `None` when nothing changed, so empty
-    /// input and duplicates never touch disk or the session.
-    fn stage_add_filtered_word(&mut self, word: &str) -> Option<PendingSave> {
-        let word = word.trim();
-        if word.is_empty() {
-            return None;
-        }
-        let folded = word.to_lowercase();
-        if self
-            .config
-            .filtered_words
-            .iter()
-            .any(|existing| existing.to_lowercase() == folded)
-        {
-            return None;
-        }
-        let config = Rc::make_mut(&mut self.config);
-        config.filtered_words.push(word.to_owned());
-        let forward = hermes::Command::SetFilteredWords(config.filtered_words.clone());
-        Some(self.stage_save(forward))
-    }
-
-    /// Synchronous in-memory half of [`Self::apply_remove_filtered_word`].
-    /// Yields `None` when the index is out of range, so no disk touch happens.
-    fn stage_remove_filtered_word(&mut self, index: usize) -> Option<PendingSave> {
-        if index >= self.config.filtered_words.len() {
-            return None;
-        }
-        Rc::make_mut(&mut self.config).filtered_words.remove(index);
-        let forward = hermes::Command::SetFilteredWords(self.config.filtered_words.clone());
-        Some(self.stage_save(forward))
-    }
-
-    fn forward(&self, command: hermes::Command) {
-        if let Err(error) = self.session_tx.send(command) {
-            // The session owns the receiver for the runtime lifetime, so a
-            // send failure is unexpected; surface it rather than dropping it.
-            log::info!(target: "config", "hermes command send failed: {error}");
-        }
-    }
-
-    fn set_error(&mut self, message: impl Into<String>) {
-        self.error = message.into();
-        self.push_frame();
-    }
-
-    pub fn push_frame(&self) {
-        self.frame.store(FrameState {
-            config: self.config.as_ref().clone(),
-            status: self.status.clone(),
-            error: self.error.clone(),
-            update: self.update.clone(),
+        worker.shared.update(|state| {
+            state.config = params.config;
         });
-        self.gui.notify_frame();
+        worker
     }
-}
 
-/// Runs the downloaded package's installer, then reopens the app. Only
-/// MSI installs ever download, so this always runs `msiexec` through the
-/// detached waiter in `update`.
-fn launch_installer(path: &Path) -> anyhow::Result<()> {
-    update::install_msi_and_relaunch(path)
+    /// Publishes the slot without changing it: for startup, so the GUI
+    /// (which loaded version 0 before this thread started) reloads.
+    pub fn publish(&self) {
+        self.shared.update(|_| {});
+    }
+
+    pub(crate) fn set_error(&self, message: String) {
+        self.shared.update(|state| {
+            state.error = message;
+        });
+    }
+
+    pub(crate) fn clear_error(&self) {
+        self.shared.update(|state| {
+            state.error.clear();
+        });
+    }
+
+    /// Rebuilds the channel rows from the tracked users and subscription
+    /// states, records connection health, and publishes. Called after
+    /// every change on either side; cheap enough to run unconditionally.
+    pub(crate) fn refresh_views(&self, conn_error: Option<String>) {
+        let mut channels: Vec<ChannelStatus> = self
+            .channels
+            .iter()
+            .map(|(id, user)| ChannelStatus {
+                channel_id: *id,
+                login: user.channel_name.clone(),
+                display_name: user.channel_display_name.clone(),
+                title_status: self.status_for(crate::balesh::Topic::BroadcastSettingsUpdate(*id)),
+                live_status: self.status_for(crate::balesh::Topic::VideoPlaybackById(*id)),
+                stream_id: user.stream_id,
+                stream_title: user.stream_title.clone(),
+                stream_start: user.stream_start,
+                viewers: user.viewers,
+                collaboration_viewers: user.collaboration_viewers,
+                game: user
+                    .game
+                    .as_ref()
+                    .map(|game| game.display_name.clone())
+                    .filter(|name| !name.is_empty())
+                    .or_else(|| user.game.as_ref().map(|game| game.name.clone())),
+                game_id: user.game.as_ref().map(|game| game.id),
+            })
+            .collect();
+        channels.sort_by(|left, right| left.login.cmp(&right.login));
+        let connected = self.socket.is_some() && self.welcomed;
+        self.shared.update(|state| {
+            state.channels = channels;
+            state.connected = connected;
+            state.conn_error = conn_error;
+        });
+    }
+
+    /// Persists the latest config without stalling the loop: the config
+    /// is cloned out from under a short read (the only thing serialization
+    /// needs) and the write runs as a job. Failures surface as an error;
+    /// successes change nothing — the mutation already published.
+    pub(crate) fn queue_save(&mut self) {
+        let path = self.config_path.clone();
+        let config = self.shared.read().config.clone();
+        self.jobs.push(Box::pin(async move {
+            JobDone::SaveFinished(config.save(&path).await)
+        }));
+    }
+
+    /// Shows a toast without stalling the loop: resolving the avatar and
+    /// handing off parks only this job, so intents and socket traffic keep
+    /// flowing while the image downloads.
+    pub(crate) fn queue_toast(
+        &mut self,
+        summary: String,
+        body: String,
+        sound: bool,
+        image: Option<String>,
+        login: Option<String>,
+    ) {
+        self.jobs.push(Box::pin(async move {
+            notifier::show(summary, body, sound, image, login).await;
+            JobDone::ToastShown
+        }));
+    }
+
+    pub(crate) fn forward_tray(&self, action: TrayAction) {
+        self.shared.notify_tray(action);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use crate::config::Channel;
+    use futures_util::StreamExt as _;
 
-    fn test_work(
-        config: Config,
-        path: PathBuf,
-    ) -> (Rc<RefCell<WorkState>>, Receiver<hermes::Command>) {
+    fn test_worker(config: Config, name: &str) -> (Worker, PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("siphon-worker-{name}-{}.json", std::process::id()));
         let (_ui_tx, ui_rx) = kanal::unbounded();
-        let (_tray_event_tx, tray_events) = kanal::unbounded();
-        let (session_tx, session_rx) = kanal::unbounded();
-        let (toast_tx, _) = kanal::unbounded();
-        let work = Rc::new(RefCell::new(WorkState::new(
-            WorkContext {
-                config_path: path,
-                config,
-                ui_rx,
-                frame: SharedFrame::new(FrameState::default()),
-                tray_events,
-                gui: GuiSender::pair().0,
-                toast_tx,
-            },
-            session_tx,
-        )));
-        (work, session_rx)
+        let (_tray_tx, tray_rx) = kanal::unbounded();
+        let (shared, _gui_rx) = SharedFrame::pair(AppState::default());
+        let worker = Worker::new(WorkerParams {
+            config_path: path.clone(),
+            config,
+            ui_rx,
+            tray_rx,
+            shared,
+        });
+        (worker, path)
     }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -665,32 +420,45 @@ mod tests {
         }
     }
 
-    /// Async read of the persisted config, so tests never block the
-    /// thread-per-core runtime on synchronous file IO.
-    async fn saved_config(path: &Path) -> Config {
+    async fn saved_config(path: &std::path::Path) -> Config {
         let bytes = compio::fs::read(path)
             .await
             .expect("saved config should be readable");
         serde_json::from_slice(&bytes).expect("saved config should parse")
     }
 
-    async fn file_exists(path: &Path) -> bool {
-        compio::fs::metadata(path).await.is_ok()
+    /// Drives one queued job to completion through the worker's own
+    /// completion handler.
+    async fn drive_one(worker: &mut Worker) {
+        let done = worker.jobs.next().await.expect("a job should be queued");
+        worker.handle_job(done).await;
     }
 
     #[test]
-    fn remove_channel_persists_and_forwards() {
-        let path =
-            std::env::temp_dir().join(format!("siphon-state-remove-{}.json", std::process::id()));
+    fn remove_channel_publishes_and_saves() {
         let config = Config {
             channels: vec![channel("alice", 1), channel("bob", 2)],
             ..Config::default()
         };
-        let (work, session_rx) = test_work(config, path.clone());
+        let (mut worker, path) = test_worker(config, "remove");
 
         block_on(async {
             compio::fs::remove_file(&path).await.ok();
-            WorkState::apply_remove_channel(&work, 1).await;
+            worker.apply_remove_channel(1).await;
+
+            {
+                let state = worker.shared.read();
+                assert_eq!(
+                    state
+                        .config
+                        .channels
+                        .iter()
+                        .map(|c| c.login.as_str())
+                        .collect::<Vec<_>>(),
+                    ["bob"]
+                );
+            }
+            drive_one(&mut worker).await;
 
             let saved = saved_config(&path).await;
             assert_eq!(
@@ -701,21 +469,35 @@ mod tests {
                     .collect::<Vec<_>>(),
                 ["bob"]
             );
-            let command = session_rx
-                .try_recv()
-                .expect("channel open")
-                .expect("command forwarded");
-            assert!(matches!(command, hermes::Command::RemoveChannel(id) if id == 1));
             compio::fs::remove_file(&path).await.ok();
         });
     }
 
     #[test]
-    fn finish_add_login_persists_resolved_channel() {
-        let path =
-            std::env::temp_dir().join(format!("siphon-state-add-{}.json", std::process::id()));
-        let (work, session_rx) = test_work(Config::default(), path.clone());
-        let user = http::User {
+    fn add_login_validates_and_dedupes() {
+        let (mut worker, _path) = test_worker(Config::default(), "validate");
+
+        assert_eq!(
+            worker.request_add_login("  ALICE ".to_owned()),
+            Some("alice".to_owned())
+        );
+        {
+            let state = worker.shared.read();
+            assert_eq!(state.pending, ["alice"]);
+            assert!(state.error.is_empty());
+        }
+
+        assert_eq!(worker.request_add_login("alice".to_owned()), None);
+        assert_eq!(worker.request_add_login("ALICE".to_owned()), None);
+        assert_eq!(worker.request_add_login("   ".to_owned()), None);
+        let state = worker.shared.read();
+        assert_eq!(state.pending, ["alice"]);
+    }
+
+    #[test]
+    fn complete_add_login_persists_resolved_channel() {
+        let (mut worker, path) = test_worker(Config::default(), "add");
+        let user = http::ResolvedChannel {
             channel_id: 7,
             channel_name: "alice".to_owned(),
             channel_display_name: "Alice".to_owned(),
@@ -723,136 +505,107 @@ mod tests {
             stream_id: 9,
             stream_title: None,
             stream_start: None,
+            stream_created_at: None,
+            viewers: Some(145),
+            collaboration_viewers: Some(889),
             game: None,
             live: false,
         };
 
         block_on(async {
             compio::fs::remove_file(&path).await.ok();
-            WorkState::finish_add_login(&work, "alice".to_owned(), Ok(Some(user))).await;
+            worker.request_add_login("alice".to_owned());
+            // Drop the resolve job the request queued: this test drives
+            // the completion directly with a canned user.
+            worker.jobs.clear();
+            worker
+                .complete_add_login("alice".to_owned(), Ok(Some(user)))
+                .await;
+
+            {
+                let state = worker.shared.read();
+                assert!(state.pending.is_empty());
+                assert_eq!(state.config.channels.len(), 1);
+                // The row must publish from the tracked user, or the GUI
+                // keeps the Pending fallback despite an accepted subscribe.
+                let row = state
+                    .channels
+                    .iter()
+                    .find(|c| c.channel_id == 7)
+                    .expect("resolved channel should publish a row");
+                assert_eq!(row.stream_id, 9);
+                assert_eq!(row.viewers, Some(145));
+                assert_eq!(row.collaboration_viewers, Some(889));
+            }
+            assert!(worker.channels.contains_key(&7));
+            drive_one(&mut worker).await;
 
             let saved = saved_config(&path).await;
             assert_eq!(saved.channels.len(), 1);
             assert_eq!(saved.channels[0].login, "alice");
             assert_eq!(saved.channels[0].id, 7);
-            let command = session_rx
-                .try_recv()
-                .expect("channel open")
-                .expect("command forwarded");
-            assert!(matches!(command, hermes::Command::AddChannel(login) if login == "alice"));
             compio::fs::remove_file(&path).await.ok();
         });
     }
 
     #[test]
-    fn finish_add_login_surfaces_error_without_touching_disk() {
-        let path =
-            std::env::temp_dir().join(format!("siphon-state-typo-{}.json", std::process::id()));
-        let shared = SharedFrame::new(FrameState::default());
-        let (_ui_tx, ui_rx) = kanal::unbounded();
-        let (_tray_event_tx, tray_events) = kanal::unbounded();
-        let (session_tx, session_rx) = kanal::unbounded();
-        let (toast_tx, _) = kanal::unbounded();
-        let work = Rc::new(RefCell::new(WorkState::new(
-            WorkContext {
-                config_path: path.clone(),
-                config: Config::default(),
-                ui_rx,
-                frame: shared.clone(),
-                tray_events,
-                gui: GuiSender::pair().0,
-                toast_tx,
-            },
-            session_tx,
-        )));
+    fn complete_add_login_surfaces_typo_without_touching_disk() {
+        let (mut worker, path) = test_worker(Config::default(), "typo");
 
         block_on(async {
             compio::fs::remove_file(&path).await.ok();
-            WorkState::finish_add_login(&work, "typo".to_owned(), Ok(None)).await;
+            worker.request_add_login("typo".to_owned());
+            worker.jobs.clear();
+            worker.complete_add_login("typo".to_owned(), Ok(None)).await;
 
             assert!(
-                !file_exists(&path).await,
+                compio::fs::metadata(&path).await.is_err(),
                 "typos must not create a config file"
             );
-            assert!(
-                session_rx.is_empty(),
-                "unresolvable logins must not reach the session"
-            );
-            let (frame, _) = shared.load_newer(0).expect("error frame pushed");
-            assert!(
-                !frame.error.is_empty(),
-                "unresolvable logins must surface an error"
-            );
+            assert!(worker.jobs.is_empty());
+            let state = worker.shared.read();
+            assert!(state.pending.is_empty());
+            assert!(!state.error.is_empty());
         });
     }
 
     #[test]
-    fn finish_add_login_surfaces_transport_error_without_touching_disk() {
-        let path = std::env::temp_dir().join(format!(
-            "siphon-state-resolve-err-{}.json",
-            std::process::id()
-        ));
-        let (work, session_rx) = test_work(Config::default(), path.clone());
-        let shared = work.borrow().frame.clone();
+    fn complete_add_login_surfaces_transport_error_without_touching_disk() {
+        let (mut worker, path) = test_worker(Config::default(), "resolve-err");
 
         block_on(async {
             compio::fs::remove_file(&path).await.ok();
-            WorkState::finish_add_login(
-                &work,
-                "alice".to_owned(),
-                Err(anyhow::anyhow!("boom")),
-            )
-            .await;
+            worker.request_add_login("alice".to_owned());
+            worker.jobs.clear();
+            worker
+                .complete_add_login("alice".to_owned(), Err(anyhow::anyhow!("boom")))
+                .await;
 
             assert!(
-                !file_exists(&path).await,
+                compio::fs::metadata(&path).await.is_err(),
                 "failures must not create a config file"
             );
-            assert!(
-                session_rx.is_empty(),
-                "failed resolves must not reach the session"
-            );
-            let (frame, _) = shared.load_newer(0).expect("error frame pushed");
-            assert!(
-                frame.error.contains("failed to resolve alice"),
-                "transport errors keep their cause, got: {}",
-                frame.error
-            );
+            assert!(worker.jobs.is_empty());
+            let state = worker.shared.read();
+            assert!(state.error.contains("failed to resolve alice"));
         });
     }
 
     #[test]
     fn prune_ids_removes_missing_and_surfaces_error() {
-        let path =
-            std::env::temp_dir().join(format!("siphon-state-prune-{}.json", std::process::id()));
         let config = Config {
             channels: vec![channel("alice", 1), channel("bob", 2)],
             ..Config::default()
         };
-        let shared = SharedFrame::new(FrameState::default());
-        let (_ui_tx, ui_rx) = kanal::unbounded();
-        let (_tray_event_tx, tray_events) = kanal::unbounded();
-        let (session_tx, _session_rx) = kanal::unbounded::<hermes::Command>();
-        let (toast_tx, _) = kanal::unbounded();
-        let work = Rc::new(RefCell::new(WorkState::new(
-            WorkContext {
-                config_path: path.clone(),
-                config,
-                ui_rx,
-                frame: shared.clone(),
-                tray_events,
-                gui: GuiSender::pair().0,
-                toast_tx,
-            },
-            session_tx,
-        )));
+        let (mut worker, path) = test_worker(config, "prune");
 
         block_on(async {
             compio::fs::remove_file(&path).await.ok();
-            let config = work.borrow().config.clone();
+            let config = worker.shared.read().config.clone();
             config.save(&path).await.unwrap();
-            WorkState::apply_prune_ids(&work, &[1]).await;
+            worker.apply_prune_ids(&[1]);
 
+            drive_one(&mut worker).await;
             let saved = saved_config(&path).await;
             assert_eq!(
                 saved
@@ -862,12 +615,11 @@ mod tests {
                     .collect::<Vec<_>>(),
                 ["bob"]
             );
-            let (frame, _) = shared.load_newer(0).expect("frame pushed");
-            assert_eq!(frame.config.channels.len(), 1);
-            assert!(
-                !frame.error.is_empty(),
-                "pruned channels must surface an error"
-            );
+            {
+                let state = worker.shared.read();
+                assert_eq!(state.config.channels.len(), 1);
+                assert!(state.error.contains("alice"), "error was: {}", state.error);
+            }
             compio::fs::remove_file(&path).await.ok();
         });
     }

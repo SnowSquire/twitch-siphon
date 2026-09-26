@@ -1,34 +1,28 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+//! Hermes pubsub connection. Network behavior for the [`Worker`]: the
+//! batched baseline sync, the websocket lifecycle (welcome, keepalives,
+//! reconnect backoff), subscription replay, and live/title notifications.
+//! UI mutations never fetch here; adds resolve once through the add job
+//! and land through the completion path, so this side only subscribes.
+
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use compio::net::TcpStream;
 use compio::ws::tungstenite::Message;
 use compio::ws::{WebSocketStream, connect_async};
-use futures_util::{FutureExt as _, StreamExt as _};
 use serde_json::{Value, json};
 
-use crate::balesh::{CheapRng, NanoId, Topic};
-
-use crate::http::{self, Game, User};
+use crate::balesh::{NanoId, Topic};
+use crate::http::{self, Game};
 use crate::matcher::Matcher;
-use crate::notifier;
-use crate::state::WorkState;
+use crate::state::{ConnectOutcome, JobDone, SubStatus, Worker};
 
 const HERMES_URL: &str = "wss://hermes.twitch.tv/v1?clientId=kimne78kx3ncx6brgo4mv6wki5h1ko";
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
 const KEEPALIVE_MISSED_LIMIT: u64 = 2;
 
-pub enum Command {
-    AddChannel(String),
-    RemoveChannel(u64),
-    SetNotifyTitleChanges(bool),
-    SetSound(bool),
-    SetFilteredWords(Vec<String>),
-}
+pub(crate) type WsStream = WebSocketStream<TcpStream>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SubState {
@@ -37,47 +31,15 @@ enum SubState {
     Failed,
 }
 
-#[derive(Clone, Copy)]
-pub enum SubStatus {
-    Pending,
-    Connected,
-    Failed,
-}
-
-#[derive(Clone)]
-pub struct ChannelStatus {
-    pub channel_id: u64,
-    pub login: String,
-    pub display_name: String,
-    pub title_status: SubStatus,
-    pub live_status: SubStatus,
-}
-
-#[derive(Clone)]
-pub struct StatusSnapshot {
-    pub connected: bool,
-    pub error: Option<String>,
-    pub channels: Vec<ChannelStatus>,
-    pub pending_adds: Arc<RwLock<Vec<String>>>,
-}
-
-struct Sub {
-    id: NanoId,
+pub(crate) struct Sub {
+    pub(crate) id: NanoId,
     state: SubState,
-}
-
-type WsStream = WebSocketStream<TcpStream>;
-
-/// Notification preferences the ui can change at runtime.
-struct Preferences {
-    notify_title_changes: bool,
-    sound: bool,
 }
 
 /// Folds `words` for the byte-exact matcher and builds it. Called once at
 /// startup and again on every filter change, so the live matcher always
 /// reflects the persisted list.
-fn build_matcher(words: &[String]) -> Matcher {
+pub(crate) fn build_matcher(words: &[String]) -> Matcher {
     Matcher::new(
         &words
             .iter()
@@ -89,317 +51,159 @@ fn build_matcher(words: &[String]) -> Matcher {
     )
 }
 
-pub struct Session {
-    work: Rc<RefCell<WorkState>>,
-    command_rx: kanal::AsyncReceiver<Command>,
-    channels: HashMap<u64, User>,
-    subs: HashMap<Topic, Sub>,
-    preferences: Preferences,
-    /// Substring filter for title-change toasts, built from
-    /// `filtered_words`. Patterns are folded at build time and titles at
-    /// check time, since the matcher itself is byte-exact.
-    matcher: Matcher,
-    socket: Option<WsStream>,
-    welcomed: bool,
-    keepalive_secs: u64,
-    last_message: Instant,
-    reconnect_at: Instant,
-    reconnect_attempt: u32,
-    rng: CheapRng,
-}
-
-impl Session {
-    pub fn new(work: Rc<RefCell<WorkState>>, command_rx: kanal::AsyncReceiver<Command>) -> Self {
-        let config = work.borrow().config_snapshot();
-        let matcher = build_matcher(&config.filtered_words);
-        Self {
-            work,
-            command_rx,
-            channels: HashMap::new(),
-            subs: HashMap::new(),
-            preferences: Preferences {
-                notify_title_changes: config.notify_title_changes,
-                sound: config.sound,
-            },
-            matcher,
-
-            socket: None,
-            welcomed: false,
-            keepalive_secs: 15,
-            last_message: Instant::now(),
-            reconnect_at: Instant::now(),
-            reconnect_attempt: 0,
-            rng: CheapRng::new(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0x853c_49e6_748f_ea9b, |elapsed| elapsed.as_nanos() as u64),
-            ),
-        }
-    }
-
-    pub async fn run(&mut self) {
-        log::info!(target: "hermes", "worker started");
-        let mut tick = compio::time::interval(Duration::from_secs(1));
-        // Owned by the loop, not `self`: the recv future must not borrow
-        // `self` while command/socket handling takes `&mut self`.
-        let command_rx = self.command_rx.clone();
-        loop {
-            if self.socket.is_none() && self.has_work() && Instant::now() >= self.reconnect_at {
-                self.connect().await;
-            }
-            let command_fut = command_rx.recv().fuse();
-            let socket_fut = async {
-                match self.socket.as_mut() {
-                    Some(socket) => socket.next().await,
-                    None => std::future::pending().await,
-                }
-            }
-            .fuse();
-            let tick_fut = tick.tick().fuse();
-            futures_util::pin_mut!(command_fut, socket_fut, tick_fut);
-            futures_util::select! {
-                command = command_fut => {
-                    let Ok(command) = command else { return };
-                    self.on_command(command).await;
-                }
-                message = socket_fut => {
-                    // `Message` owns refcounted bytes; drop before awaits below.
-                    enum SocketEvent {
-                        Text(compio::ws::tungstenite::Utf8Bytes),
-                        Closed,
-                        Ignored,
-                    }
-                    let event = match message {
-                        Some(Ok(Message::Close(_))) => {
-                            log::info!(target: "hermes", "server sent close frame");
-                            SocketEvent::Closed
-                        }
-                        Some(Ok(message)) => message
-                            .into_text()
-                            .map_or_else(|_| SocketEvent::Ignored, SocketEvent::Text),
-                        Some(Err(error)) => {
-                            log::info!(target: "hermes", "read error: {error}");
-                            SocketEvent::Closed
-                        }
-                        None => {
-                            log::info!(target: "hermes", "connection closed");
-                            SocketEvent::Closed
-                        }
-                    };
-                    match event {
-                        SocketEvent::Text(text) => {
-                            self.handle_message(&text).await;
-                        }
-                        SocketEvent::Closed => {
-                            self.on_disconnect().await;
-                        }
-                        SocketEvent::Ignored => {}
-                    }
-                }
-                _ = tick_fut => {
-                    self.on_tick().await;
-                }
-            }
-        }
-    }
-
-    /// Anything to subscribe to. The session map stays empty until the first
-    /// `connect` populates it, so the persisted list is checked as well.
-    fn has_work(&self) -> bool {
-        !self.channels.is_empty() || !self.work.borrow().config_snapshot().channels.is_empty()
-    }
-
-    /// Whether `title` trips the word filter. Case-insensitive: patterns are
-    /// already folded, so the title folds here before matching.
+impl Worker {
     fn title_filtered(&self, title: &str) -> bool {
         self.matcher.is_match(&title.to_lowercase())
     }
 
-    /// Applies one ui mutation. Additions are subscribed on the live
-    /// connection when there is one; removals are unsubscribed the same way.
-    /// The socket itself is never restarted for config changes.
-    async fn on_command(&mut self, command: Command) {
-        match command {
-            Command::AddChannel(login) => self.add_channel(login).await,
-            Command::RemoveChannel(id) => self.remove_channel(id).await,
-            Command::SetNotifyTitleChanges(value) => {
-                log::info!(target: "hermes", "notify_title_changes={value}");
-                self.preferences.notify_title_changes = value;
-            }
-            Command::SetSound(value) => {
-                log::info!(target: "hermes", "sound={value}");
-                self.preferences.sound = value;
-            }
-            Command::SetFilteredWords(words) => {
-                log::info!(target: "hermes", "filtered_words={words:?}");
-                self.matcher = build_matcher(&words);
+    pub(crate) fn start_connect(&mut self) {
+        let mut ids: Vec<u64> = self
+            .shared
+            .read()
+            .config
+            .channels
+            .iter()
+            .map(|c| c.id)
+            .collect();
+
+        for id in self.channels.keys() {
+            if !ids.contains(id) {
+                ids.push(*id);
             }
         }
-    }
-
-    async fn add_channel(&mut self, login: String) {
-        if self
-            .channels
-            .values()
-            .any(|user| user.channel_name.eq_ignore_ascii_case(&login))
-        {
+        if ids.is_empty() {
             return;
         }
-        log::info!(target: "hermes", "channel {login} added");
-        // One targeted fetch seeds the notify baseline (title/game/live).
-        // Unknown logins are pruned; transport failures only surface a
-        // status so the persisted channel survives a retry.
-        match http::fetch_user(&login).await {
-            Ok(Some(user)) => {
-                let id = user.channel_id;
-                self.upsert(user);
-                self.after_resolve(id).await;
-                self.emit_status(None);
-            }
-            Ok(None) => {
-                log::info!(
-                    target: "hermes",
-                    "gql returned no channel named {login}, is it a typo?"
-                );
-                self.emit_status(Some(&format!("channel {login} not found")));
-                WorkState::apply_prune_login(&self.work, &login).await;
-            }
-            Err(error) => {
-                log::info!(target: "hermes", "failed to fetch channel: {error}");
-                self.emit_status(Some(&format!("failed to fetch {login}: {error}")));
-            }
-        }
-    }
-
-    /// Registers the new channel's topics and subscribes them immediately
-    /// when the session is already live; otherwise the next welcome replays
-    /// everything, including these.
-    async fn after_resolve(&mut self, id: u64) {
-        self.ensure_subs(id);
-        if self.welcomed {
-            self.subscribe_channel(id).await;
-        }
-    }
-
-    async fn remove_channel(&mut self, id: u64) {
-        if let Some(user) = self.channels.remove(&id) {
-            log::info!(target: "hermes", "channel {} removed", user.channel_name);
-            for topic in Topic::for_channel(id) {
-                if let Some(sub) = self.subs.remove(&topic) {
-                    log::info!(target: "hermes", "unsubscribing from {topic}");
-                    let message_id = self.rng.nano_id();
-                    self.send_message(&json!({
-                        "type": "unsubscribe",
-                        "id": message_id,
-                        "unsubscribe": { "id": sub.id },
-                        "timestamp": crate::logging::timestamp(),
-                    }))
-                    .await;
+        self.connecting = true;
+        self.jobs.push(Box::pin(async move {
+            let fetched = http::fetch_channels(&ids).await;
+            let ok = fetched.is_ok();
+            let (channels, missing) = match fetched {
+                Ok(fetched) => {
+                    let seen: HashSet<u64> = fetched.iter().map(|user| user.channel_id).collect();
+                    let missing: Vec<u64> = ids
+                        .iter()
+                        .copied()
+                        .filter(|id| !seen.contains(id))
+                        .collect();
+                    (fetched, missing)
                 }
-            }
-        }
-        self.emit_status(None);
-    }
-
-    /// Drops one id's topics without touching the socket: the channel is
-    /// gone (deleted/renamed), so there is nothing to unsubscribe from that
-    /// the server would still recognize. Welcome replays never see it again.
-    fn drop_channel(&mut self, id: u64) {
-        self.channels.remove(&id);
-        for topic in Topic::for_channel(id) {
-            self.subs.remove(&topic);
-        }
-    }
-
-    async fn connect(&mut self) {
-        // One batched resolve per connect keeps the notify baseline fresh.
-        // Ids that resolve to nothing are pruned from the persisted list.
-        let ids: Vec<u64> = {
-            let config = self.work.borrow().config_snapshot();
-            let mut ids: Vec<u64> = config.channels.iter().map(|c| c.id).collect();
-            for id in self.channels.keys() {
-                if !ids.contains(id) {
-                    ids.push(*id);
+                Err(error) => {
+                    log::info!(target: "hermes", "channel refresh failed: {error}");
+                    (Vec::new(), Vec::new())
                 }
+            };
+            // Nothing resolved and nothing stale could either: connecting
+            // would just time out waiting for a welcome with no topics.
+            if ok && channels.is_empty() {
+                return JobDone::ConnectFinished(Box::new(ConnectOutcome::Connected {
+                    channels: Vec::new(),
+                    missing,
+                    socket: None,
+                }));
             }
-            ids
-        };
-        self.sync(&ids).await;
+
+            log::info!(target: "hermes", "connecting to {HERMES_URL}");
+            let socket = match connect_async(HERMES_URL).await {
+                Ok((socket, _)) => {
+                    log::info!(target: "hermes", "connected, waiting for welcome");
+                    Some(socket)
+                }
+                Err(error) => {
+                    log::info!(target: "hermes", "connect failed: {error}");
+                    None
+                }
+            };
+
+            JobDone::ConnectFinished(Box::new(ConnectOutcome::Connected {
+                channels,
+                missing,
+                socket,
+            }))
+        }));
+    }
+
+    /// Applies a finished connection attempt. Users for channels removed
+    /// mid-flight are dropped; ids that resolve to nothing are pruned
+    /// from the persisted list. An empty baseline or a failed handshake
+    /// backs off; only a live socket with something to watch is kept.
+    pub(crate) async fn complete_connect(&mut self, outcome: ConnectOutcome) {
+        self.connecting = false;
+        let ConnectOutcome::Connected {
+            channels,
+            missing,
+            socket,
+        } = outcome;
+        let wanted: HashSet<u64> = self
+            .shared
+            .read()
+            .config
+            .channels
+            .iter()
+            .map(|channel| channel.id)
+            .collect();
+        for channel in channels {
+            if !wanted.contains(&channel.channel_id) {
+                continue;
+            }
+            let id = channel.channel_id;
+            self.track_channel(channel);
+            self.ensure_subs(id);
+        }
+        let missing: Vec<u64> = missing
+            .into_iter()
+            .filter(|id| wanted.contains(id))
+            .collect();
+        if !missing.is_empty() {
+            self.apply_prune_ids(&missing);
+        }
+        let mut socket = socket;
         if self.channels.is_empty() {
-            // Connecting with no subscribable channel would just time out.
+            if let Some(mut stray) = socket.take() {
+                let _ = stray.close(None).await;
+            }
             log::info!(
                 target: "hermes",
                 "no channels resolved, retrying (typo in a login?)"
             );
-            self.emit_status(Some("no channels found for the configured logins"));
             self.schedule_reconnect();
+            self.refresh_views(Some(
+                "no channels found for the configured logins".to_owned(),
+            ));
             return;
         }
-        log::info!(target: "hermes", "connecting to {HERMES_URL}");
-        match connect_async(HERMES_URL).await {
-            Ok((socket, _)) => {
-                log::info!(target: "hermes", "connected, waiting for welcome");
-                self.socket = Some(socket);
-                self.welcomed = false;
-                self.last_message = Instant::now();
-            }
-            Err(error) => {
-                log::info!(target: "hermes", "connect failed: {error}");
-                self.on_disconnect().await;
-            }
-        }
-    }
-
-    /// Merges one gql response into the tracked state: every returned
-    /// channel refreshes its baseline and gains its two subscription
-    /// entries. Ids that resolve to nothing are dropped from the session
-    /// and pruned from the persisted list with an error, instead of
-    /// lingering as fake entries.
-    async fn sync(&mut self, ids: &[u64]) {
-        if ids.is_empty() {
+        let Some(live) = socket else {
+            self.schedule_reconnect();
+            self.refresh_views(None);
             return;
-        }
-        match http::fetch_users(ids).await {
-            Ok(users) => {
-                let mut seen = std::collections::HashSet::with_capacity(users.len());
-                for user in users {
-                    seen.insert(user.channel_id);
-                    let id = user.channel_id;
-                    self.upsert(user);
-                    self.ensure_subs(id);
-                }
-                let missing: Vec<u64> = ids
-                    .iter()
-                    .copied()
-                    .filter(|id| !seen.contains(id))
-                    .collect();
-                for id in &missing {
-                    log::info!(target: "hermes", "channel {id} no longer resolves, dropping");
-                    self.drop_channel(*id);
-                }
-                if !missing.is_empty() {
-                    self.emit_status(Some("a channel no longer resolves and was removed"));
-                    WorkState::apply_prune_ids(&self.work, &missing).await;
-                }
-            }
-            Err(error) => {
-                log::info!(target: "hermes", "channel refresh failed: {error}");
-                // Still subscribe known ids: live notifications work from
-                // pubsub alone, only the title baseline is stale.
-                for id in ids {
-                    self.ensure_subs(*id);
-                }
-            }
-        }
+        };
+        self.socket = Some(live);
+        self.welcomed = false;
+        self.last_message = Instant::now();
     }
 
-    fn upsert(&mut self, user: User) {
-        self.channels.insert(user.channel_id, user);
+    /// Tracks a fresh resolve, logging stream_id/createdAt at info so the
+    /// release file carries it: the baseline logs on first sight when the
+    /// request carried stream data, later resolves log only when the
+    /// stream identity moved. Steady refreshes stay silent.
+    pub(crate) fn track_channel(&mut self, user: http::ResolvedChannel) {
+        let id = user.channel_id;
+        if should_log_stream(self.channels.get(&id), &user) {
+            log::info!(
+                target: "hermes",
+                "stream {}({}): stream_id={} createdAt={}",
+                user.channel_name,
+                user.channel_id,
+                user.stream_id,
+                user.stream_created_at.as_deref().unwrap_or("none"),
+            );
+        }
+        self.channels.insert(id, user);
     }
 
     /// Registers a channel's two topics if not registered already. Entries
     /// persist across reconnects; every welcome replays the whole map.
-    fn ensure_subs(&mut self, id: u64) {
+    pub(crate) fn ensure_subs(&mut self, id: u64) {
         for topic in Topic::for_channel(id) {
             self.subs.entry(topic).or_insert_with(|| Sub {
                 id: self.rng.nano_id(),
@@ -408,13 +212,40 @@ impl Session {
         }
     }
 
+    /// Takes one channel's topics out of the map, returning their
+    /// subscription ids for unsubscribing.
+    pub(crate) fn take_channel_subs(&mut self, id: u64) -> Vec<(NanoId, Topic)> {
+        Topic::for_channel(id)
+            .into_iter()
+            .filter_map(|topic| self.subs.remove(&topic).map(|sub| (sub.id, topic)))
+            .collect()
+    }
+
+    /// Drops one id's topics without touching the socket: the channel is
+    /// gone (deleted/renamed), so there is nothing to unsubscribe from that
+    /// the server would still recognize. Welcome replays never see it again.
+    pub(crate) fn drop_channel(&mut self, id: u64) {
+        self.channels.remove(&id);
+        for topic in Topic::for_channel(id) {
+            self.subs.remove(&topic);
+        }
+    }
+
+    pub(crate) fn status_for(&self, topic: Topic) -> SubStatus {
+        match self.subs.get(&topic).map(|sub| sub.state) {
+            None | Some(SubState::Pending) => SubStatus::Pending,
+            Some(SubState::Subscribed) => SubStatus::Connected,
+            Some(SubState::Failed) => SubStatus::Failed,
+        }
+    }
+
     /// Drops the socket and backs off. Reconnects always start fresh and
     /// replay all subscriptions; recovering server-side sessions is not
     /// worth the state machine for a handful of topics.
-    async fn on_disconnect(&mut self) {
+    pub(crate) async fn on_disconnect(&mut self) {
         self.close_socket().await;
         self.welcomed = false;
-        self.emit_status(None);
+        self.refresh_views(None);
         self.schedule_reconnect();
     }
 
@@ -435,7 +266,7 @@ impl Session {
 
     /// Fires once a second: enforces the welcome timeout and drops the
     /// connection after missed keepalives.
-    async fn on_tick(&mut self) {
+    pub(crate) async fn on_tick(&mut self) {
         if self.socket.is_none() {
             return;
         }
@@ -458,7 +289,7 @@ impl Session {
         }
     }
 
-    async fn handle_message(&mut self, text: &str) {
+    pub(crate) async fn handle_message(&mut self, text: &str) {
         // any frame at all is proof the connection is alive, even a blank
         // one that carries no payload
         self.last_message = Instant::now();
@@ -480,17 +311,18 @@ impl Session {
                 self.reconnect_attempt = 0;
                 self.keepalive_secs = message["welcome"]["keepaliveSec"].as_u64().unwrap_or(15);
                 log::info!(target: "hermes", "welcome: keepalive={}s", self.keepalive_secs);
-                let toast_tx = self.work.borrow().toast_tx.clone();
-                notifier::notify(
-                    &toast_tx,
-                    summary,
-                    &format!("watching {} channel(s)", self.channels.len()),
-                    self.preferences.sound,
+                let (sound, count) = {
+                    let state = self.shared.read();
+                    (state.config.sound, self.channels.len())
+                };
+                self.queue_toast(
+                    summary.to_owned(),
+                    format!("watching {count} channel(s)"),
+                    sound,
                     None,
                     None,
-                )
-                .await;
-                self.emit_status(None);
+                );
+                self.refresh_views(None);
                 self.resubscribe_all().await;
             }
             Some("keepalive") => {}
@@ -518,12 +350,12 @@ impl Session {
                     "subscription to {topic} {}",
                     if ok { "accepted" } else { "rejected" }
                 );
-                self.emit_status(None);
+                self.refresh_views(None);
             }
             Some("unsubscribeResponse") => {
                 log::info!(target: "hermes", "unsubscribe response: {text}");
             }
-            Some("notification") => self.handle_notification(&message).await,
+            Some("notification") => self.handle_notification(&message),
             _ => log::info!(target: "hermes", "unknown message: {text}"),
         }
     }
@@ -545,7 +377,7 @@ impl Session {
 
     /// Subscribes a single channel's topics; used when a channel is added
     /// to an already-live session (welcomes replay everything instead).
-    async fn subscribe_channel(&mut self, id: u64) {
+    pub(crate) async fn subscribe_channel(&mut self, id: u64) {
         let pending: Vec<(NanoId, Topic)> = Topic::for_channel(id)
             .into_iter()
             .filter_map(|topic| self.subs.get(&topic).map(|sub| (sub.id, topic)))
@@ -578,7 +410,7 @@ impl Session {
         .await;
     }
 
-    async fn send_message(&mut self, message: &Value) {
+    pub(crate) async fn send_message(&mut self, message: &Value) {
         let Some(socket) = self.socket.as_mut() else {
             return;
         };
@@ -588,7 +420,7 @@ impl Session {
         }
     }
 
-    async fn handle_notification(&mut self, message: &Value) {
+    fn handle_notification(&mut self, message: &Value) {
         let Some(target) = message["notification"]["subscription"]["id"]
             .as_str()
             .and_then(NanoId::parse)
@@ -618,15 +450,15 @@ impl Session {
         );
         match topic {
             Topic::BroadcastSettingsUpdate(channel_id) => {
-                self.on_broadcast_settings_update(channel_id, &pubsub).await;
+                self.on_broadcast_settings_update(channel_id, &pubsub);
             }
             Topic::VideoPlaybackById(channel_id) => {
-                self.on_video_playback(channel_id, &pubsub).await;
+                self.on_video_playback(channel_id, &pubsub);
             }
         }
     }
 
-    async fn on_broadcast_settings_update(&mut self, channel_id: u64, pubsub: &Value) {
+    fn on_broadcast_settings_update(&mut self, channel_id: u64, pubsub: &Value) {
         let status = pubsub["status"].as_str().unwrap_or_default().to_owned();
         let old_status = pubsub["old_status"].as_str().unwrap_or_default();
         let game = pubsub["game"]
@@ -637,49 +469,65 @@ impl Session {
         // Whether the new title trips the word filter; only title changes
         // are gated on it below.
         let title_filtered = self.title_filtered(&status);
-        let Some(user) = self.channels.get_mut(&channel_id) else {
-            return;
+        let (notify_titles, sound) = {
+            let state = self.shared.read();
+            (state.config.notify_title_changes, state.config.sound)
         };
-        let title_changed = user.stream_title.as_deref() != Some(status.as_str());
-        let game_changed = game.as_deref() != user.game.as_ref().map(|game| game.name.as_str());
-        let can_notify = self.preferences.notify_title_changes && !user.live;
-        // Only title changes are filtered: a game-only update still notifies
-        // on a filtered title, while a retitle into one stays silent.
-        let filtered = title_changed && title_filtered;
-        if can_notify && (title_changed || game_changed) && !filtered {
-            let mut lines = Vec::new();
-            if title_changed {
-                lines.push(format!("{old_status} → {status}"));
-            }
-            if game_changed {
-                lines.push(format!("{old_game} → {}", game.as_deref().unwrap_or("")));
-            }
-            let what = [
-                title_changed.then_some("title"),
-                game_changed.then_some("game"),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" & ");
-            let toast_tx = self.work.borrow().toast_tx.clone();
-            notifier::notify(
-                &toast_tx,
-                &format!("[{}] {what} changed", user.channel_display_name),
-                &lines.join("\n"),
-                self.preferences.sound,
-                Some(user.profile_image_url.as_str()).filter(|url| !url.is_empty()),
-                Some(&user.channel_name),
-            )
-            .await;
+        // The borrow ends before the toast queues: `queue_toast` needs
+        // `&mut self` while the toast data below borrows the user.
+        let toast = {
+            let Some(user) = self.channels.get_mut(&channel_id) else {
+                return;
+            };
+            let title_changed = user.stream_title.as_deref() != Some(status.as_str());
+            let game_changed = game.as_deref() != user.game.as_ref().map(|game| game.name.as_str());
+            let can_notify = notify_titles && !user.live;
+            // Only title changes are filtered: a game-only update still notifies
+            // on a filtered title, while a retitle into one stays silent.
+            let filtered = title_changed && title_filtered;
+            let toast = if can_notify && (title_changed || game_changed) && !filtered {
+                let mut lines = Vec::new();
+                if title_changed {
+                    lines.push(format!("{old_status} → {status}"));
+                }
+                if game_changed {
+                    lines.push(format!("{old_game} → {}", game.as_deref().unwrap_or("")));
+                }
+                let what = [
+                    title_changed.then_some("title"),
+                    game_changed.then_some("game"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" & ");
+                Some((
+                    format!("[{}] {what} changed", user.channel_display_name),
+                    lines.join("\n"),
+                    user.profile_image_url.clone(),
+                    user.channel_name.clone(),
+                ))
+            } else {
+                None
+            };
+            user.stream_title = Some(status).filter(|title| !title.is_empty());
+            let game_display_name = user.game.as_ref().map(|game| game.display_name.clone());
+            user.game = game.zip(pubsub["game_id"].as_u64()).map(|(name, id)| Game {
+                id,
+                name,
+                display_name: game_display_name.unwrap_or_default(),
+            });
+            toast
+        };
+        if let Some((summary, body, avatar, login)) = toast {
+            self.queue_toast(
+                summary,
+                body,
+                sound,
+                Some(avatar).filter(|url| !url.is_empty()),
+                Some(login),
+            );
         }
-        user.stream_title = Some(status).filter(|title| !title.is_empty());
-        let game_display_name = user.game.as_ref().map(|game| game.display_name.clone());
-        user.game = game.zip(pubsub["game_id"].as_u64()).map(|(name, id)| Game {
-            id,
-            name,
-            display_name: game_display_name.unwrap_or_default(),
-        });
     }
 
     /// Handles `video-playback-by-id` pubsub payloads. Known `type` values:
@@ -689,8 +537,22 @@ impl Session {
     ///   `{"type":"viewcount","viewers":583,"server_time":1789245232.108976,`
     ///   `"collaboration_status":"none","collaboration_viewers":0,`
     ///   `"costream_status":"","costream_viewers":0}`
-    async fn on_video_playback(&mut self, channel_id: u64, pubsub: &Value) {
+    fn on_video_playback(&mut self, channel_id: u64, pubsub: &Value) {
         match pubsub["type"].as_str() {
+            Some("viewcount") => {
+                if let Some(user) = self.channels.get_mut(&channel_id) {
+                    user.viewers = pubsub["viewers"]
+                        .as_u64()
+                        .and_then(|x| u32::try_from(x).ok());
+                    user.collaboration_viewers = None;
+                    if pubsub["collaboration_status"].as_str() == Some("in_collaboration") {
+                        user.collaboration_viewers = pubsub["collaboration_viewers"]
+                            .as_u64()
+                            .and_then(|x| u32::try_from(x).ok());
+                    }
+                    self.refresh_views(None);
+                }
+            }
             Some("stream-up") => {
                 // Notify from the cached baseline first; refresh from gql after.
                 let cached = self.channels.get_mut(&channel_id).map(|user| {
@@ -703,65 +565,102 @@ impl Session {
                         user.profile_image_url.clone(),
                     )
                 });
-                self.emit_status(None);
-                let notified = if let Some((login, display_name, game, title, avatar)) = cached {
-                    let toast_tx = self.work.borrow().toast_tx.clone();
-                    Self::notify_live(
-                        &toast_tx,
+                self.refresh_views(None);
+                let (sound, wanted) = {
+                    let state = self.shared.read();
+                    (
+                        state.config.sound,
+                        state
+                            .config
+                            .channels
+                            .iter()
+                            .any(|channel| channel.id == channel_id),
+                    )
+                };
+                if !wanted && cached.is_none() {
+                    return;
+                }
+                if let Some((login, display_name, game, title, avatar)) = cached {
+                    self.notify_live(
                         &display_name,
                         game.as_ref(),
                         title.as_deref(),
                         &avatar,
-                        self.preferences.sound,
+                        sound,
                         Some(&login),
-                    )
-                    .await;
-                    true
-                } else {
-                    false
-                };
-                match http::fetch_users(&[channel_id]).await {
-                    Ok(users) => {
-                        let Some(mut user) =
-                            users.into_iter().find(|user| user.channel_id == channel_id)
-                        else {
-                            return;
-                        };
-                        user.live = true;
-                        if !notified {
-                            let toast_tx = self.work.borrow().toast_tx.clone();
-                            Self::notify_live(
-                                &toast_tx,
-                                &user.channel_display_name,
-                                user.game.as_ref(),
-                                user.stream_title.as_deref(),
-                                &user.profile_image_url,
-                                self.preferences.sound,
-                                Some(&user.channel_name),
-                            )
-                            .await;
-                        }
-                        self.upsert(user);
-                        self.emit_status(None);
-                    }
-                    Err(error) => {
-                        log::info!(target: "hermes", "stream-up refresh failed: {error}");
-                    }
+                    );
                 }
+                self.jobs.push(Box::pin(async move {
+                    JobDone::LiveRefreshed(channel_id, http::fetch_channels(&[channel_id]).await)
+                }));
             }
             Some("stream-down") => {
                 if let Some(user) = self.channels.get_mut(&channel_id) {
                     user.live = false;
+                    user.collaboration_viewers = None;
+                    user.viewers = None;
+                    self.refresh_views(None);
                 }
             }
             _ => {}
         }
     }
 
+    /// Applies a finished `stream-up` refresh: the fresh user replaces the
+    /// optimistic baseline. Channels removed mid-flight are dropped;
+    /// channels the baseline never knew still notify from the fresh data.
+    pub(crate) fn complete_live_refresh(
+        &mut self,
+        channel_id: u64,
+        result: anyhow::Result<Vec<http::ResolvedChannel>>,
+    ) {
+        let wanted = self.channels.contains_key(&channel_id)
+            || self
+                .shared
+                .read()
+                .config
+                .channels
+                .iter()
+                .any(|channel| channel.id == channel_id);
+        if !wanted {
+            return;
+        }
+        match result {
+            Ok(users) => {
+                let Some(mut user) = users.into_iter().find(|user| user.channel_id == channel_id)
+                else {
+                    return;
+                };
+                user.live = true;
+                if !self.channels.contains_key(&channel_id) {
+                    let sound = self.shared.read().config.sound;
+                    let display_name = user.channel_display_name.clone();
+                    let game = user.game.clone();
+                    let title = user.stream_title.clone();
+                    let avatar = user.profile_image_url.clone();
+                    let login = user.channel_name.clone();
+                    self.notify_live(
+                        &display_name,
+                        game.as_ref(),
+                        title.as_deref(),
+                        &avatar,
+                        sound,
+                        Some(&login),
+                    );
+                }
+                self.track_channel(user);
+                self.refresh_views(None);
+            }
+            Err(error) => {
+                log::info!(target: "hermes", "stream-up refresh failed: {error}");
+            }
+        }
+    }
+
     /// "is LIVE" notification shared by the optimistic (cached baseline)
     /// and fallback (fresh gql user) paths.
-    async fn notify_live(
-        toast_tx: &kanal::Sender<notifier::ToastJob>,
+    fn notify_live(
+        &mut self,
         display_name: &str,
         game: Option<&Game>,
         title: Option<&str>,
@@ -775,89 +674,96 @@ impl Session {
             (None, Some(title)) => title.to_owned(),
             (None, None) => String::new(),
         };
-        notifier::notify(
-            toast_tx,
-            &format!("[{display_name}] is LIVE"),
-            &body,
+        self.queue_toast(
+            format!("[{display_name}] is LIVE"),
+            body,
             sound,
-            Some(avatar).filter(|url| !url.is_empty()),
-            login,
-        )
-        .await;
+            Some(avatar.to_owned()).filter(|url| !url.is_empty()),
+            login.map(str::to_owned),
+        );
     }
+}
 
-    fn status_for(&self, topic: Topic) -> SubStatus {
-        match self.subs.get(&topic).map(|sub| sub.state) {
-            None | Some(SubState::Pending) => SubStatus::Pending,
-            Some(SubState::Subscribed) => SubStatus::Connected,
-            Some(SubState::Failed) => SubStatus::Failed,
+/// Whether a fresh resolve deserves a stream log: first sight logs only
+/// when the request carried stream data, later resolves log only when the
+/// stream identity moved.
+fn should_log_stream(
+    old: Option<&http::ResolvedChannel>,
+    new: &http::ResolvedChannel,
+) -> bool {
+    match old {
+        None => new.stream_created_at.is_some(),
+        Some(prev) => {
+            prev.stream_id != new.stream_id
+                || prev.stream_created_at != new.stream_created_at
         }
-    }
-
-    fn emit_status(&self, error: Option<&str>) {
-        let mut channels: Vec<ChannelStatus> = self
-            .channels
-            .iter()
-            .map(|(id, user)| ChannelStatus {
-                channel_id: *id,
-                login: user.channel_name.clone(),
-                display_name: user.channel_display_name.clone(),
-                title_status: self.status_for(Topic::BroadcastSettingsUpdate(*id)),
-                live_status: self.status_for(Topic::VideoPlaybackById(*id)),
-            })
-            .collect();
-        channels.sort_by(|left, right| left.login.cmp(&right.login));
-        let status = StatusSnapshot {
-            connected: self.socket.is_some() && self.welcomed,
-            error: error.map(String::from),
-            channels,
-            pending_adds: self.work.borrow().pending_adds.clone(),
-        };
-        self.work.borrow_mut().set_status(status);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::config::Config;
-    use crate::state::{GuiSender, SharedFrame, WorkContext, WorkState};
+    use crate::state::{AppState, SharedFrame, Worker, WorkerParams};
 
-    fn test_session(filtered_words: &[&str]) -> Session {
+    fn test_worker(filtered_words: &[&str]) -> Worker {
         let config = Config {
             filtered_words: filtered_words.iter().map(ToString::to_string).collect(),
             ..Config::default()
         };
         let (_ui_tx, ui_rx) = kanal::unbounded();
-        let (_tray_event_tx, tray_events) = kanal::unbounded();
-        let (session_tx, command_rx) = kanal::unbounded();
-        let (toast_tx, _) = kanal::unbounded();
-        let work = Rc::new(RefCell::new(WorkState::new(
-            WorkContext {
-                config_path: std::env::temp_dir().join("siphon-hermes-test.json"),
-                config,
-                ui_rx,
-                frame: SharedFrame::default(),
-                tray_events,
-                toast_tx,
-                gui: GuiSender::pair().0,
-            },
-            session_tx,
-        )));
-        Session::new(work, command_rx.to_async())
+        let (_tray_tx, tray_rx) = kanal::unbounded();
+        let (shared, _gui_rx) = SharedFrame::pair(AppState::default());
+        Worker::new(WorkerParams {
+            config_path: std::env::temp_dir().join("siphon-hermes-test.json"),
+            config,
+            ui_rx,
+            tray_rx,
+            shared,
+        })
     }
 
     #[test]
     fn title_filter_matches_case_insensitively() {
-        let session = test_session(&["offline"]);
-        assert!(session.title_filtered("going OFFLINE for the night"));
-        assert!(session.title_filtered("Offline"));
-        assert!(!session.title_filtered("online and grinding ranked"));
+        let worker = test_worker(&["offline"]);
+        assert!(worker.title_filtered("going OFFLINE for the night"));
+        assert!(worker.title_filtered("Offline"));
+        assert!(!worker.title_filtered("online and grinding ranked"));
     }
 
     #[test]
     fn title_filter_empty_word_list_matches_nothing() {
-        let session = test_session(&[]);
-        assert!(!session.title_filtered("offline"));
+        let worker = test_worker(&[]);
+        assert!(!worker.title_filtered("offline"));
+    }
+
+    fn resolved(stream_id: u64, created_at: Option<&str>) -> crate::http::ResolvedChannel {
+        crate::http::ResolvedChannel {
+            channel_id: 1,
+            channel_name: "alice".to_owned(),
+            channel_display_name: "Alice".to_owned(),
+            profile_image_url: String::new(),
+            stream_id,
+            stream_title: None,
+            stream_start: None,
+            stream_created_at: created_at.map(str::to_owned),
+            viewers: None,
+            collaboration_viewers: None,
+            game: None,
+            live: created_at.is_some(),
+        }
+    }
+
+    #[test]
+    fn stream_log_baselines_only_with_data_and_changes_only() {
+        // Startup baseline: log when the request carried stream data.
+        assert!(super::should_log_stream(None, &resolved(9, Some("2026-09-10T18:35:06Z"))));
+        assert!(!super::should_log_stream(None, &resolved(9, None)));
+        // Steady refresh: identical identity stays silent.
+        let live = resolved(9, Some("2026-09-10T18:35:06Z"));
+        assert!(!super::should_log_stream(Some(&live), &resolved(9, Some("2026-09-10T18:35:06Z"))));
+        // New stream id or timestamp logs, including going offline.
+        assert!(super::should_log_stream(Some(&live), &resolved(10, Some("2026-09-10T18:35:06Z"))));
+        assert!(super::should_log_stream(Some(&live), &resolved(9, Some("2026-09-11T18:35:06Z"))));
+        assert!(super::should_log_stream(Some(&live), &resolved(9, None)));
     }
 }

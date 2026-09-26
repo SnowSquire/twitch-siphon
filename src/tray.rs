@@ -5,31 +5,35 @@
 //! tooltip, and Open/Quit menu are registered directly with the shell, so
 //! tray clicks arrive as window messages on the GUI thread and forward
 //! into a [`kanal`] channel with sends that never block; the work task and
-//! the GUI pump await tray events instead of polling. Notifications stay on
+//! the GUI pump await tray events instead of polling. The channel sender
+//! rides in the message window's user data, which is how the global window
+//! procedure reaches per-window state. Notifications stay on
 //! WinRT toasts in `notifier`, never on the legacy `NIF_INFO` balloon this
 //! same struct could show.
 //! The `Tray` value must stay alive for the icon to remain: dropping it
 //! removes the icon, and `Tray` always owns one — absence of a tray is
 //! `Option<Tray>::None` at the call site, never a flag inside `Tray`.
 
-use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
+use anyhow::Context as _;
 use kanal::Sender;
 use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION,
-    NOTIFYICONDATAW, NOTIFYICON_VERSION_4, Shell_NotifyIconW,
+    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NIN_SELECT,
+    NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DestroyIcon, DestroyMenu, DestroyWindow, GetCursorPos, HICON, HMENU,
-    LookupIconIdFromDirectoryEx, LR_DEFAULTCOLOR, MF_STRING, RegisterClassW,
-    RegisterWindowMessageW, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TrackPopupMenuEx, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, HWND_MESSAGE,
+    DestroyIcon, DestroyMenu, DestroyWindow, GWLP_USERDATA, GetCursorPos, GetWindowLongPtrW, HICON,
+    HMENU, HWND_MESSAGE, LR_DEFAULTCOLOR, LookupIconIdFromDirectoryEx, MF_STRING, RegisterClassW,
+    RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TrackPopupMenuEx, WM_APP, WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
+    WM_RBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -49,6 +53,9 @@ static ICON_ICO: &[u8] = include_bytes!("../icons/icon.ico");
 const TRAY_ID: u32 = 1;
 /// Callback message the shell posts to the message window on tray input.
 const WM_TRAY: u32 = WM_APP + 1;
+/// Keyboard activation of the icon; `windows-sys` omits this `shellapi.h`
+/// `NIN_*` value (`WM_USER + 1`), so it is spelled out here.
+const NIN_KEYSELECT: u32 = 1025;
 const MENU_OPEN: i32 = 1001;
 const MENU_QUIT: i32 = 1002;
 
@@ -57,9 +64,77 @@ const TOOLTIP: &str = "Siphon Dev";
 #[cfg(not(debug_assertions))]
 const TOOLTIP: &str = "Siphon";
 
-/// Clicks landing here come from the window procedure; set once by
-/// [`spawn_proxy`] before the icon is built.
-static TRAY_TX: OnceLock<Sender<TrayAction>> = OnceLock::new();
+/// Owns the tray icon, its message window, and the channel sender tray
+/// clicks forward into. Held alive for the app lifetime; dropping removes
+/// the icon from the tray.
+pub struct Tray {
+    hwnd: HWND,
+    icon: HICON,
+    /// The sender allocation behind the window's user data pointer. The
+    /// window is destroyed first in `Drop`, so the pointer never outlives
+    /// what it points to.
+    tx: *mut Sender<TrayAction>,
+}
+
+/// Builds the tray icon with clicks forwarding into `tx`. Call on the GUI
+/// thread so the message window that receives the shell callbacks pumps
+/// with the event loop.
+pub fn build(tx: Sender<TrayAction>) -> anyhow::Result<Tray> {
+    let tx = Box::new(tx);
+    let hwnd = ensure_window(&tx)?;
+    let icon = load_icon()?;
+    add_icon(hwnd, icon)?;
+    if let Ok(mut guard) = icon_state().lock() {
+        *guard = Some(IconState { hwnd, icon });
+    }
+    Ok(Tray {
+        hwnd,
+        icon,
+        tx: Box::into_raw(tx),
+    })
+}
+
+impl Drop for Tray {
+    fn drop(&mut self) {
+        let nid: NOTIFYICONDATAW = NOTIFYICONDATAW {
+            cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: self.hwnd,
+            uID: TRAY_ID,
+            ..Default::default()
+        };
+        // SAFETY: populated with the id from `add_icon`; the shell stops
+        // tracking the icon.
+        unsafe { Shell_NotifyIconW(NIM_DELETE, &nid) };
+        // SAFETY: icon created by `load_icon` and owned by this value.
+        unsafe { DestroyIcon(self.icon) };
+        // SAFETY: message window created by `ensure_window` for this value.
+        // Destroying it first retires the window procedure, so nothing can
+        // still read the sender pointer freed below; only this thread ever
+        // touched either.
+        unsafe { DestroyWindow(self.hwnd) };
+        // SAFETY: `tx` came from `Box::into_raw` in `build`; the sole
+        // borrower is gone.
+        unsafe { drop(Box::from_raw(self.tx)) };
+    }
+}
+
+/// Reads the sender back out of the message window's user data. Set once
+/// by [`build`] for the window's whole life; the owning `Tray` outlives
+/// the window, and only the GUI thread that owns both ever reads it.
+fn sender_for(hwnd: HWND) -> Option<&'static Sender<TrayAction>> {
+    // SAFETY: user data holds a `*const Sender` installed at window
+    // creation; the pointer stays valid until `Drop` destroys the window.
+    unsafe {
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Sender<TrayAction>;
+        ptr.as_ref()
+    }
+}
+
+fn send_action(hwnd: HWND, action: TrayAction) {
+    if let Some(tx) = sender_for(hwnd) {
+        let _ = tx.send(action);
+    }
+}
 
 struct IconState {
     hwnd: HWND,
@@ -87,61 +162,6 @@ fn taskbar_created() -> u32 {
         // only read for the duration of the call.
         unsafe { RegisterWindowMessageW(name.as_ptr()) }
     })
-}
-
-/// Owns the tray icon and its message window. Held alive for the app
-/// lifetime; dropping removes the icon from the tray.
-pub struct Tray {
-    hwnd: HWND,
-    icon: HICON,
-}
-
-/// Creates the channel tray clicks forward into. The sender is stored for
-/// the window procedure; the work task awaits the returned receiver
-/// alongside UI intents, so no polling.
-pub fn spawn_proxy() -> kanal::Receiver<TrayAction> {
-    let (tx, rx) = kanal::unbounded::<TrayAction>();
-    let _ = TRAY_TX.set(tx);
-    rx
-}
-
-/// Builds the tray icon. Call on the GUI thread so the message window that
-/// receives the shell callbacks pumps with the event loop.
-pub fn build() -> Result<Tray, String> {
-    // A throwaway keeps `build` usable where `spawn_proxy` never ran; clicks
-    // then go nowhere instead of failing the build.
-    TRAY_TX.get_or_init(|| kanal::unbounded::<TrayAction>().0);
-    let hwnd = ensure_window()?;
-    let icon = load_icon()?;
-    add_icon(hwnd, icon)?;
-    if let Ok(mut guard) = icon_state().lock() {
-        *guard = Some(IconState { hwnd, icon });
-    }
-    Ok(Tray { hwnd, icon })
-}
-
-impl Drop for Tray {
-    fn drop(&mut self) {
-        let nid: NOTIFYICONDATAW = NOTIFYICONDATAW {
-            cbSize: size_of::<NOTIFYICONDATAW>() as u32,
-            hWnd: self.hwnd,
-            uID: TRAY_ID,
-            ..Default::default()
-        };
-        // SAFETY: populated with the id from `add_icon`; the shell stops
-        // tracking the icon.
-        unsafe { Shell_NotifyIconW(NIM_DELETE, &nid) };
-        // SAFETY: icon created by `load_icon` and owned by this value.
-        unsafe { DestroyIcon(self.icon) };
-        // SAFETY: message window created by `ensure_window` for this value.
-        unsafe { DestroyWindow(self.hwnd) };
-    }
-}
-
-fn send_action(action: TrayAction) {
-    if let Some(tx) = TRAY_TX.get() {
-        let _ = tx.send(action);
-    }
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -173,24 +193,27 @@ fn valid_ico(data: &[u8]) -> bool {
         let offset = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as usize;
         size != 0
             && offset >= directory
-            && offset.checked_add(size).is_some_and(|end| end <= data.len())
+            && offset
+                .checked_add(size)
+                .is_some_and(|end| end <= data.len())
     })
 }
 
 /// Picks the shell-preferred image out of the bundled `.ico`.
-fn load_icon() -> Result<HICON, String> {
+pub(crate) fn load_icon() -> anyhow::Result<HICON> {
     if !valid_ico(ICON_ICO) {
-        return Err("bundled icon.ico failed validation".to_owned());
+        anyhow::bail!("bundled icon.ico failed validation");
     }
     // SAFETY: `ICON_ICO` passed validation as a well-formed `.ico`
     // directory, so the lookup only reads its header.
-    let offset = unsafe { LookupIconIdFromDirectoryEx(ICON_ICO.as_ptr(), 1, 0, 0, LR_DEFAULTCOLOR) };
+    let offset =
+        unsafe { LookupIconIdFromDirectoryEx(ICON_ICO.as_ptr(), 1, 0, 0, LR_DEFAULTCOLOR) };
     if offset <= 0 {
-        return Err("bundled icon.ico lookup failed".to_owned());
+        anyhow::bail!("bundled icon.ico lookup failed");
     }
     let rest = ICON_ICO
         .get(offset as usize..)
-        .ok_or_else(|| "bundled icon.ico entry out of bounds".to_owned())?;
+        .context("bundled icon.ico entry out of bounds")?;
     // SAFETY: `rest` starts at the validated image offset and spans to the
     // end of the bundle, which is exactly the resource slice the call reads.
     let icon = unsafe {
@@ -205,7 +228,7 @@ fn load_icon() -> Result<HICON, String> {
         )
     };
     if icon.is_null() {
-        return Err("CreateIconFromResourceEx failed".to_owned());
+        anyhow::bail!("CreateIconFromResourceEx failed");
     }
     Ok(icon)
 }
@@ -225,13 +248,13 @@ fn base_nid(hwnd: HWND, icon: HICON) -> NOTIFYICONDATAW {
 }
 
 /// Adds the icon and opts into version 4 event behavior.
-fn add_icon(hwnd: HWND, icon: HICON) -> Result<(), String> {
+fn add_icon(hwnd: HWND, icon: HICON) -> anyhow::Result<()> {
     let nid = base_nid(hwnd, icon);
     // SAFETY: `nid` is fully populated with our live window, icon, tooltip,
     // and callback message; the shell only reads it for this call.
     let added = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
     if added == 0 {
-        return Err("Shell_NotifyIconW NIM_ADD failed".to_owned());
+        anyhow::bail!("Shell_NotifyIconW NIM_ADD failed");
     }
     let mut versioned = nid;
     versioned.Anonymous.uVersion = NOTIFYICON_VERSION_4;
@@ -283,21 +306,22 @@ fn show_menu(hwnd: HWND) {
     // SAFETY: destroying the menu created above, exactly once.
     unsafe { DestroyMenu(menu) };
     if picked == MENU_OPEN {
-        send_action(TrayAction::Show);
+        send_action(hwnd, TrayAction::Show);
     } else if picked == MENU_QUIT {
-        send_action(TrayAction::Quit);
+        send_action(hwnd, TrayAction::Quit);
     }
 }
 
 static CLASS_READY: AtomicBool = AtomicBool::new(false);
 
 /// Registers the message-window class once and creates the hidden window
-/// the shell posts tray input to.
-fn ensure_window() -> Result<HWND, String> {
+/// the shell posts tray input to. Stashes `tx` in the window's user data
+/// so the window procedure can forward clicks into it.
+fn ensure_window(tx: &Sender<TrayAction>) -> anyhow::Result<HWND> {
     // SAFETY: null name queries the current module handle.
     let instance = unsafe { GetModuleHandleW(core::ptr::null()) };
     if instance.is_null() {
-        return Err("GetModuleHandleW failed".to_owned());
+        anyhow::bail!("GetModuleHandleW failed");
     }
     if !CLASS_READY.load(Ordering::Acquire) {
         let class = wide("SiphonTray");
@@ -315,7 +339,7 @@ fn ensure_window() -> Result<HWND, String> {
             // registration.
             let error = unsafe { GetLastError() };
             if error != ERROR_CLASS_ALREADY_EXISTS {
-                return Err(format!("RegisterClassW failed ({error})"));
+                anyhow::bail!("RegisterClassW failed ({error})");
             }
         }
         CLASS_READY.store(true, Ordering::Release);
@@ -340,8 +364,18 @@ fn ensure_window() -> Result<HWND, String> {
         )
     };
     if hwnd.is_null() {
-        return Err("CreateWindowExW failed".to_owned());
+        anyhow::bail!("CreateWindowExW failed");
     }
+    // SAFETY: `hwnd` is our own live window; user data is a pointer-sized
+    // slot the procedure reads back in `sender_for`, and the `Tray` owner
+    // outlives the window.
+    unsafe {
+        SetWindowLongPtrW(
+            hwnd,
+            GWLP_USERDATA,
+            tx as *const Sender<TrayAction> as isize,
+        )
+    };
     Ok(hwnd)
 }
 
@@ -354,9 +388,13 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if msg == WM_TRAY {
-        match lparam as u32 {
-            WM_LBUTTONUP => send_action(TrayAction::Show),
-            WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd),
+        // Version 4 carries the icon id in the high word of `lparam`,
+        // so only the low word names the event.
+        match (lparam as u32) & 0xFFFF {
+            NIN_SELECT | NIN_KEYSELECT | WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
+                send_action(hwnd, TrayAction::Show);
+            }
+            WM_RBUTTONUP | WM_RBUTTONDBLCLK | WM_CONTEXTMENU => show_menu(hwnd),
             _ => {}
         }
         return 0;

@@ -13,18 +13,11 @@ mod notifier;
 mod state;
 mod tray;
 mod update;
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use wgpui::{App, Application, Bounds, QuitMode, WindowBounds, WindowOptions, px, size};
 
 use crate::app::{SiphonView, WindowParams};
 use crate::config::Config;
-use crate::event_loop::EventLoop;
-use crate::hermes::Session;
-use crate::state::{
-    FrameState, GuiSender, SharedFrame, UiIntent, UpdateStatus, WorkContext, WorkState,
-};
+use crate::state::{AppState, SharedFrame, UiIntent, UpdateStatus, Worker, WorkerParams};
 use crate::tray::TrayAction;
 
 /// Single-instance key and config directory name. Debug builds use a
@@ -68,60 +61,53 @@ fn main() {
     );
 
     let (ui_tx, ui_rx) = kanal::unbounded::<UiIntent>();
-    let (toast_tx, toast_rx) = kanal::unbounded::<notifier::ToastJob>();
-    let tray_events = tray::spawn_proxy();
-    let (gui_tx, gui_rx) = GuiSender::pair();
+    let (tray_tx, tray_rx) = kanal::unbounded::<TrayAction>();
     // Latest-only snapshot slot shared by the work thread (writer) and the
-    // GUI thread (reader); the sender beside every store wakes the GUI.
-    let frame = SharedFrame::new(FrameState {
+    // GUI thread (reader); every store wakes the foreground pump.
+    let (frame, gui_rx) = SharedFrame::pair(AppState {
         config: config.clone(),
-        status: None,
+        connected: false,
+        conn_error: None,
+        channels: Vec::new(),
+        pending: Vec::new(),
         error: String::new(),
         update: UpdateStatus::Idle,
     });
 
     //worker thread, runs hermes and event loop
     let work_frame = frame.clone();
-    let wake_gui = gui_tx.clone();
-    let theme_gui = gui_tx.clone();
+    let wake_frame = frame.clone();
+    let theme_frame = frame.clone();
     let _work_thread = std::thread::Builder::new()
         .name("worker thread".to_owned())
         .spawn(move || {
             // System theme notifications land here: no new thread, and COM
             // stays off the foreground thread's clipboard apartment.
-            crate::app::watch_system_theme(theme_gui);
+            crate::app::watch_system_theme(theme_frame);
             {
                 compio::runtime::Runtime::new()
                     .expect("compio runtime")
                     .block_on(async move {
-                        let (session_tx, command_rx) = kanal::unbounded();
-                        let work = Rc::new(RefCell::new(WorkState::new(
-                            WorkContext {
-                                config_path,
-                                config,
-                                ui_rx,
-                                frame: work_frame,
-                                tray_events,
-                                toast_tx,
-                                gui: gui_tx,
-                            },
-                            session_tx,
-                        )));
-                        work.borrow().push_frame();
-                        let mut hermes = Session::new(Rc::clone(&work), command_rx.to_async());
-                        let mut events = EventLoop::new(work, toast_rx.to_async());
-
-                        futures_util::future::join(events.run(), hermes.run()).await;
+                        let mut worker = Worker::new(WorkerParams {
+                            config_path,
+                            config,
+                            ui_rx,
+                            tray_rx,
+                            shared: work_frame,
+                        });
+                        worker.publish();
+                        worker.push_update_check();
+                        worker.run().await;
                     });
             };
         })
         .expect("hermes thread");
 
-    // Second launches wake the window through the same gui channel the
+    // Second launches wake the window through the frame channel the
     // foreground pump awaits, so showing works even while hidden.
     let single = app_single_instance::start_primary(APP_ID, move || {
         log::info!(target: "single", "wake signal received");
-        wake_gui.notify_tray(TrayAction::Show);
+        wake_frame.notify_tray(TrayAction::Show);
     });
 
     Application::new().run(move |cx: &mut App| {
@@ -131,7 +117,7 @@ fn main() {
         cx.set_quit_mode(QuitMode::Explicit);
         // Built here so every platform constructs it on the event-loop
         // thread; the view owns it afterwards, and dropping removes it.
-        let tray = match tray::build() {
+        let tray = match tray::build(tray_tx) {
             Ok(tray) => Some(tray),
             Err(error) => {
                 log::error!(target: "tray", "tray build failed: {error}");

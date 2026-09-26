@@ -19,8 +19,8 @@ pub(crate) fn client() -> anyhow::Result<cyper::Client> {
     Ok(cyper::Client::new()?)
 }
 
-const USERS_BY_IDS_QUERY: &str = "query UsersByIds($ids:[ID!]){users(ids:$ids){id login displayName profileImageURL(width:70) broadcastSettings{id title game{id name displayName}}stream{id createdAt}}}";
-const USER_BY_LOGIN_QUERY: &str = "query UserByLogin($login:String!){user(login:$login){id login displayName profileImageURL(width:70) broadcastSettings{id title game{id name displayName}}stream{id createdAt}}}";
+const USERS_BY_IDS_QUERY: &str = "query UsersByIds($ids:[ID!]){users(ids:$ids){id login displayName profileImageURL(width:70) lastBroadcast{id title game{id name displayName}}stream{id createdAt viewersCount collaborationViewersCount}}}";
+const USER_BY_LOGIN_QUERY: &str = "query UserByLogin($login:String!){user(login:$login){id login displayName profileImageURL(width:70) lastBroadcast{id title game{id name displayName}}stream{id createdAt viewersCount collaborationViewersCount}}}";
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -32,7 +32,7 @@ pub struct Game {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct User {
+pub struct ResolvedChannel {
     pub channel_id: u64,
     pub channel_name: String,
     pub channel_display_name: String,
@@ -41,6 +41,10 @@ pub struct User {
     pub stream_title: Option<String>,
     /// Milliseconds since the unix epoch; `None` when offline.
     pub stream_start: Option<i64>,
+    /// Raw `createdAt` from the stream, kept for logging; `None` offline.
+    pub stream_created_at: Option<String>,
+    pub viewers: Option<u32>,
+    pub collaboration_viewers: Option<u32>,
     pub game: Option<Game>,
     pub live: bool,
 }
@@ -80,7 +84,7 @@ struct GqlUser {
     display_name: Option<String>,
     #[serde(rename = "profileImageURL")]
     profile_image_url: Option<String>,
-    #[serde(rename = "broadcastSettings")]
+    #[serde(rename = "lastBroadcast")]
     broadcast: Option<GqlBroadcast>,
     stream: Option<GqlStream>,
 }
@@ -106,6 +110,10 @@ struct GqlGame {
 struct GqlStream {
     #[serde(rename = "createdAt")]
     created_at: Option<String>,
+    #[serde(rename = "viewersCount")]
+    viewers_count: Option<u32>,
+    #[serde(rename = "collaborationViewersCount")]
+    collaboration_viewers_count: Option<u32>,
 }
 
 // GQL `ID` scalars arrive as strings ("12345") but may serialize as
@@ -132,9 +140,9 @@ where
 }
 
 impl GqlUser {
-    fn into_user(self) -> Option<User> {
+    fn into_channel(self) -> Option<ResolvedChannel> {
         let broadcast = self.broadcast?;
-        Some(User {
+        Some(ResolvedChannel {
             channel_id: self.id?,
             channel_name: self.login.filter(|s| !s.is_empty())?,
             channel_display_name: self.display_name.filter(|s| !s.is_empty())?,
@@ -146,6 +154,10 @@ impl GqlUser {
                 .as_ref()
                 .and_then(|stream| stream.created_at.as_deref())
                 .and_then(parse_iso_ms),
+            stream_created_at: self
+                .stream
+                .as_ref()
+                .and_then(|stream| stream.created_at.clone()),
             game: broadcast.game.and_then(|game| {
                 Some(Game {
                     id: game.id?,
@@ -153,6 +165,11 @@ impl GqlUser {
                     display_name: game.display_name?,
                 })
             }),
+            collaboration_viewers: self
+                .stream
+                .as_ref()
+                .and_then(|stream| stream.collaboration_viewers_count),
+            viewers: self.stream.as_ref().and_then(|stream| stream.viewers_count),
             live: self.stream.is_some(),
         })
     }
@@ -160,7 +177,7 @@ impl GqlUser {
 
 /// Resolves one login. `Ok(None)` means the login does not resolve
 /// (unknown login or unparseable user); `Err` is transport/decode failure.
-pub async fn fetch_user(login: &str) -> anyhow::Result<Option<User>> {
+pub async fn fetch_channel(login: &str) -> anyhow::Result<Option<ResolvedChannel>> {
     let client = client()?;
     log::info!(target: "gql", "request: login={login:?}");
     let response = compio::time::timeout(
@@ -192,7 +209,7 @@ pub async fn fetch_user(login: &str) -> anyhow::Result<Option<User>> {
     let user = response
         .data
         .and_then(|data| data.user)
-        .and_then(GqlUser::into_user)
+        .and_then(GqlUser::into_channel)
         .filter(|user| user.channel_name.eq_ignore_ascii_case(login));
 
     if let Some(user) = &user {
@@ -209,7 +226,7 @@ pub async fn fetch_user(login: &str) -> anyhow::Result<Option<User>> {
     Ok(user)
 }
 
-pub async fn fetch_users(ids: &[u64]) -> anyhow::Result<Vec<User>> {
+pub async fn fetch_channels(ids: &[u64]) -> anyhow::Result<Vec<ResolvedChannel>> {
     let client = client()?;
     log::info!(target: "gql", "request: ids={ids:?}");
     let response = compio::time::timeout(
@@ -243,7 +260,7 @@ pub async fn fetch_users(ids: &[u64]) -> anyhow::Result<Vec<User>> {
         .and_then(|data| data.users)
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|raw| raw.and_then(GqlUser::into_user))
+        .filter_map(|raw| raw.and_then(GqlUser::into_channel))
         .collect::<Vec<_>>();
 
     log::info!(
@@ -305,23 +322,23 @@ mod tests {
 
     use super::{GqlIdsResponse, GqlLoginResponse, GqlUser};
 
-    fn decode_users(body: &[u8]) -> Vec<super::User> {
+    fn decode_users(body: &[u8]) -> Vec<super::ResolvedChannel> {
         let response: GqlIdsResponse = serde_json::from_slice(body).unwrap();
         response
             .data
             .and_then(|data| data.users)
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|raw| raw.and_then(GqlUser::into_user))
+            .filter_map(|raw| raw.and_then(GqlUser::into_channel))
             .collect()
     }
 
-    fn decode_login(body: &[u8]) -> Option<super::User> {
+    fn decode_login(body: &[u8]) -> Option<super::ResolvedChannel> {
         let response: GqlLoginResponse = serde_json::from_slice(body).unwrap();
         response
             .data
             .and_then(|data| data.user)
-            .and_then(GqlUser::into_user)
+            .and_then(GqlUser::into_channel)
     }
 
     #[test]
@@ -329,9 +346,10 @@ mod tests {
         let body = br#"{"data": {"users": [
                 {"id": "123", "login": "alice", "displayName": "Alice",
                  "profileImageURL": "http://x/y.png",
-                 "broadcastSettings": {"id": "999", "title": "hi",
+                 "lastBroadcast": {"id": "999", "title": "hi",
                     "game": {"id": "10", "name": "g", "displayName": "G"}},
-                 "stream": {"id": "1", "createdAt": "2026-09-10T18:35:06Z"}}
+                 "stream": {"id": "1", "createdAt": "2026-09-10T18:35:06Z",
+                    "viewersCount": 583, "collaborationViewersCount": null}}
             ]}}"#;
         let users = decode_users(body);
         assert_eq!(users.len(), 1, "{users:?}");
@@ -350,6 +368,8 @@ mod tests {
         assert_eq!(game.id, 10);
         assert_eq!(game.name, "g");
         assert_eq!(game.display_name, "G");
+        assert_eq!(user.viewers, Some(583));
+        assert_eq!(user.collaboration_viewers, None);
         assert!(user.live);
     }
 
@@ -358,7 +378,7 @@ mod tests {
         let body = br#"{"data": {"users": [
                 {"id": 456, "login": "bob", "displayName": "Bob",
                  "profileImageURL": "http://x/z.png",
-                 "broadcastSettings": {"id": 777, "title": "", "game": null},
+                 "lastBroadcast": {"id": 777, "title": "", "game": null},
                  "stream": null}
             ]}}"#;
         let users = decode_users(body);
@@ -368,6 +388,8 @@ mod tests {
         assert_eq!(user.stream_id, 777);
         assert!(user.stream_title.is_none());
         assert!(user.stream_start.is_none());
+        assert!(user.viewers.is_none());
+        assert!(user.collaboration_viewers.is_none());
         assert!(user.game.is_none());
         assert!(!user.live);
     }
@@ -377,13 +399,13 @@ mod tests {
         let body = br#"{"data": {"users": [
                 null,
                 {"id": "bad", "login": "ghost",
-                 "broadcastSettings": {"id": "1", "title": "t", "game": null},
+                 "lastBroadcast": {"id": "1", "title": "t", "game": null},
                  "stream": null},
                 {"id": "789", "login": "nobra",
-                 "broadcastSettings": null, "stream": null},
+                 "lastBroadcast": null, "stream": null},
                 {"id": "123", "login": "alice", "displayName": "Alice",
                  "profileImageURL": "http://x/y.png",
-                 "broadcastSettings": {"id": "999", "title": "hi",
+                 "lastBroadcast": {"id": "999", "title": "hi",
                     "game": {"id": "10", "name": "g", "displayName": "G"}},
                  "stream": {"id": "1", "createdAt": "2026-09-10T18:35:06Z"}}
             ]}}"#;
@@ -404,14 +426,17 @@ mod tests {
         let body = br#"{"data": {"user":
                 {"id": "123", "login": "alice", "displayName": "Alice",
                  "profileImageURL": "http://x/y.png",
-                 "broadcastSettings": {"id": "999", "title": "hi",
+                 "lastBroadcast": {"id": "999", "title": "hi",
                     "game": {"id": "10", "name": "g", "displayName": "G"}},
-                 "stream": {"id": "1", "createdAt": "2026-09-10T18:35:06Z"}}
+                 "stream": {"id": "1", "createdAt": "2026-09-10T18:35:06Z",
+                    "viewersCount": 145, "collaborationViewersCount": 889}}
             }}"#;
         let user = decode_login(body).expect("user should decode");
         assert_eq!(user.channel_id, 123);
         assert_eq!(user.channel_name, "alice");
         assert_eq!(user.stream_id, 999);
+        assert_eq!(user.viewers, Some(145));
+        assert_eq!(user.collaboration_viewers, Some(889));
         assert!(user.live);
     }
 
@@ -425,7 +450,7 @@ mod tests {
                 br#"{"data": {"user":
                     {"id": "123", "login": "alice", "displayName": "Alice",
                      "profileImageURL": "http://x/y.png",
-                     "broadcastSettings": null, "stream": null}
+                     "lastBroadcast": null, "stream": null}
                 }}"#
             )
             .is_none()

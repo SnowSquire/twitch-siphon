@@ -1,17 +1,18 @@
 use kanal::Sender;
+use windows_sys::Win32::UI::WindowsAndMessaging::HICON;
 use wgpui::{
     App, AsyncApp, Context, Entity, Render, Subscription, Window, div, prelude::*, px, rgb,
 };
 use wgpui_kit::base::Disableable as _;
+use wgpui_kit::base::{Checkbox, CheckboxIndicator, CheckboxState};
 use wgpui_kit::component::Root;
 use wgpui_kit::component::button::Button;
-use wgpui_kit::component::checkbox::Checkbox;
 use wgpui_kit::component::input::{Input, InputEvent, InputState};
 use wgpui_kit::component::scroll::ScrollableElement as _;
 use wgpui_kit::component::theme::{Theme, ThemeMode};
+use wgpui_kit::component::tooltip::Tooltip;
 
-use crate::hermes::{StatusSnapshot, SubStatus};
-use crate::state::{FrameState, GuiEvent, GuiSender, SharedFrame, UiIntent, UpdateStatus};
+use crate::state::{AppState, ChannelStatus, GuiEvent, SharedFrame, SubStatus, UiIntent, UpdateStatus};
 use crate::tray::{Tray, TrayAction};
 
 const GREEN: u32 = 0x2e_a043;
@@ -40,10 +41,13 @@ pub struct SiphonView {
     ui_tx: Sender<UiIntent>,
     shared: SharedFrame,
     seen_version: u64,
-    frame: FrameState,
+    frame: AppState,
     login_input: Entity<InputState>,
     word_input: Entity<InputState>,
     tab: Tab,
+    /// Expanded channel row, showing the resolved detail between the rows.
+    /// Purely presentational: toggled by clicking the channel name.
+    expanded: Option<u64>,
     /// `None` when the tray icon failed to build: closing the window quits
     /// instead of hiding, so it can never strand invisible without a tray.
     /// Also owns the icon; dropping removes it from the tray.
@@ -52,6 +56,9 @@ pub struct SiphonView {
     /// primary, so a second launch wakes it instead of starting over.
     _single: app_single_instance::PrimaryHandle,
     hwnd: Option<isize>,
+    /// The title/taskbar icon installed by [`build`]; the window only
+    /// stores the handle, so the view owns it until drop.
+    window_icon: Option<HICON>,
     _subs: Vec<Subscription>,
 }
 
@@ -61,8 +68,10 @@ impl SiphonView {
     pub fn build(window: &mut Window, cx: &mut App, params: WindowParams) -> Entity<Root> {
         let login_input = cx.new(|cx| InputState::new(window, cx).placeholder("Add new streamer"));
         let word_input = cx.new(|cx| InputState::new(window, cx).placeholder("Add filtered word"));
-        let (frame, seen_version) = params.shared.load();
+        let frame = params.shared.read().clone();
+        let seen_version = params.shared.version();
         let hwnd = win_hwnd(window);
+        let window_icon = hwnd.and_then(set_window_icon);
         let view = cx.new(|_cx| SiphonView {
             ui_tx: params.ui_tx,
             shared: params.shared,
@@ -71,9 +80,11 @@ impl SiphonView {
             login_input: login_input.clone(),
             word_input: word_input.clone(),
             tab: Tab::Channels,
+            expanded: None,
             tray: params.tray,
             _single: params.single,
             hwnd,
+            window_icon,
             _subs: Vec::new(),
         });
 
@@ -172,9 +183,9 @@ fn windows_registry_mode() -> Option<ThemeMode> {
 /// Subscribes to the documented system theme notification. Runs on the work
 /// thread: joining the MTA there cannot disturb the foreground thread's
 /// clipboard apartment. The callback reads the reported mode and forwards
-/// it through the existing gui sender; the pump applies it directly, so
+/// it through the frame channel; the pump applies it directly, so
 /// there is no new channel, no new task, and no polling.
-pub fn watch_system_theme(gui: GuiSender) {
+pub fn watch_system_theme(frame: SharedFrame) {
     use windows::Foundation::TypedEventHandler;
     use windows::UI::ViewManagement::UISettings;
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
@@ -195,7 +206,7 @@ pub fn watch_system_theme(gui: GuiSender) {
         match windows_registry_mode() {
             Some(mode) => {
                 log::info!(target: "app", "system theme changed to {}", mode.name());
-                gui.notify_theme(mode);
+                frame.notify_theme(mode);
             }
             None => log::info!(target: "app", "system theme changed, app mode unreadable"),
         }
@@ -245,11 +256,13 @@ fn spawn_pump(cx: &mut App, view: &Entity<SiphonView>, gui_rx: kanal::AsyncRecei
 /// Reports whether the view is still alive.
 fn reload_frame(weak: &wgpui::WeakEntity<SiphonView>, cx: &mut AsyncApp) -> wgpui::Result<()> {
     weak.update(cx, |view, cx| {
-        if let Some((frame, version)) = view.shared.load_newer(view.seen_version) {
-            view.frame = frame;
-            view.seen_version = version;
-            cx.notify();
+        let fresh = view.shared.version();
+        if fresh == view.seen_version {
+            return;
         }
+        view.frame = view.shared.read().clone();
+        view.seen_version = fresh;
+        cx.notify();
     })
 }
 
@@ -311,13 +324,6 @@ fn submit_input(
 
 impl Render for SiphonView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let pending: Vec<String> = self
-            .frame
-            .status
-            .as_ref()
-            .and_then(|snapshot| snapshot.pending_adds.read().ok())
-            .map_or_else(Vec::new, |guard| guard.clone());
-
         let root = div()
             .flex()
             .flex_col()
@@ -335,7 +341,7 @@ impl Render for SiphonView {
             .overflow_y_scrollbar();
 
         match self.tab {
-            Tab::Channels => middle = middle.child(channel_list(self, cx, &pending)),
+            Tab::Channels => middle = middle.child(channel_list(self, cx)),
             Tab::FilteredWords => middle = middle.child(word_list(self, cx)),
         }
 
@@ -343,7 +349,7 @@ impl Render for SiphonView {
         // toggles below stay pinned to the bottom of the window.
         root.child(middle)
             .child(input_row(self, cx))
-            .child(toggles(self))
+            .child(toggles(self, cx))
             .child(error_row(self))
     }
 }
@@ -377,7 +383,7 @@ fn header(view: &SiphonView, _cx: &mut Context<SiphonView>) -> impl IntoElement 
 }
 
 fn connection(view: &SiphonView) -> impl IntoElement {
-    let (text, color) = connection_text(view.frame.status.as_ref());
+    let (text, color) = connection_text(view.frame.connected, view.frame.conn_error.as_deref());
     div().text_color(rgb(color)).child(text.to_owned())
 }
 
@@ -405,12 +411,8 @@ fn tabs(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoElement {
     div().flex().flex_row().gap_2().child(channels).child(words)
 }
 
-fn channel_list(
-    view: &SiphonView,
-    _cx: &mut Context<SiphonView>,
-    pending: &[String],
-) -> impl IntoElement {
-    if view.frame.config.channels.is_empty() && pending.is_empty() {
+fn channel_list(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoElement {
+    if view.frame.config.channels.is_empty() && view.frame.pending.is_empty() {
         return div().child("No channels configured. Add a streamer below.");
     }
     let mut list = div().flex().flex_col().gap_1();
@@ -425,12 +427,11 @@ fn channel_list(
             .child(div().w(px(36.)).child("")),
     );
     for channel in &view.frame.config.channels {
-        let resolved = view.frame.status.as_ref().and_then(|snapshot| {
-            snapshot
-                .channels
-                .iter()
-                .find(|entry| entry.channel_id == channel.id)
-        });
+        let resolved = view
+            .frame
+            .channels
+            .iter()
+            .find(|entry| entry.channel_id == channel.id);
         let name = resolved
             .map(|entry| entry.display_name.as_str())
             .or(channel.display_name.as_deref())
@@ -441,25 +442,43 @@ fn channel_list(
         let id = channel.id;
         let login = channel.login.clone();
         let ui_tx = view.ui_tx.clone();
-        list =
-            list.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .items_center()
-                    .child(div().flex_1().child(name.to_owned()))
-                    .child(div().w(px(110.)).child(sub_badge(live)))
-                    .child(div().w(px(110.)).child(sub_badge(title)))
-                    .child(Button::new(format!("remove-{id}")).label("×").on_click(
-                        move |_, _, _| {
-                            log::info!(target: "app", "remove requested for {login}");
-                            let _ = ui_tx.send(UiIntent::RemoveChannel(id));
-                        },
-                    )),
-            );
+        let expanded = view.expanded == Some(id);
+        let channel_tip = format!("id {id}");
+        let name_cell = div().flex_1().child(
+            div()
+                .id(format!("channel-name-{id}"))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this: &mut SiphonView, _event, _window, cx| {
+                    this.expanded = if this.expanded == Some(id) { None } else { Some(id) };
+                    cx.notify();
+                }))
+                .tooltip(move |window, cx| Tooltip::new(channel_tip.clone()).build(window, cx))
+                .child(name.to_owned()),
+        );
+        // The detail renders below the row, never inside it, so the name,
+        // badges, and close button keep their positions when it opens.
+        let mut wrapper = div().flex().flex_col().gap_1().child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .items_center()
+                .child(name_cell)
+                .child(div().w(px(110.)).child(sub_badge(live)))
+                .child(div().w(px(110.)).child(sub_badge(title)))
+                .child(Button::new(format!("remove-{id}")).label("×").on_click(
+                    move |_, _, _| {
+                        log::info!(target: "app", "remove requested for {login}");
+                        let _ = ui_tx.send(UiIntent::RemoveChannel(id));
+                    },
+                )),
+        );
+        if expanded && let Some(entry) = resolved {
+            wrapper = wrapper.child(channel_detail(entry, cx));
+        }
+        list = list.child(wrapper);
     }
-    for login in pending {
+    for login in &view.frame.pending {
         list = list.child(
             div()
                 .flex()
@@ -475,13 +494,132 @@ fn channel_list(
     list
 }
 
-fn word_list(view: &SiphonView, _cx: &mut Context<SiphonView>) -> impl IntoElement {
-    let mut row = div()
+/// Expanded detail under its channel row: the real (login) name alongside
+/// the current title, viewers, game, and start time from the last resolve.
+/// The muted background groups it with the row above. Hovering the login
+/// shows the channel id, hovering the title shows the stream id, hovering
+/// the game shows the game id.
+fn channel_detail(entry: &ChannelStatus, cx: &App) -> impl IntoElement {
+    let channel_tip = format!("id {}", entry.channel_id);
+    let stream_tip = if entry.stream_id == 0 {
+        "no stream".to_owned()
+    } else {
+        format!("stream {}", entry.stream_id)
+    };
+    let game_tip = entry
+        .game_id
+        .map_or("no game".to_owned(), |id| format!("game {id}"));
+    div()
         .flex()
-        .flex_row()
-        .flex_wrap()
+        .flex_col()
         .gap_1()
-        .child("Titles containing these words stay silent for title-change notifications.");
+        .text_sm()
+        .rounded(px(4.))
+        .p_2()
+        .bg(Theme::global(cx).muted)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .id(format!("channel-login-{}", entry.channel_id))
+                        .tooltip(move |window, cx| {
+                            Tooltip::new(channel_tip.clone()).build(window, cx)
+                        })
+                        .child(entry.login.clone()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .id(format!("stream-title-{}", entry.channel_id))
+                        .tooltip(move |window, cx| {
+                            Tooltip::new(stream_tip.clone()).build(window, cx)
+                        })
+                        .child(
+                            entry
+                                .stream_title
+                                .clone()
+                                .unwrap_or_else(|| "no title".to_owned()),
+                        ),
+                )
+                .child(div().child(viewers_text(entry))),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .child(div().flex_1().child(format_stream_start(entry.stream_start)))
+                .child(
+                    div()
+                        .flex_1()
+                        .id(format!("game-{}", entry.channel_id))
+                        .tooltip(move |window, cx| {
+                            Tooltip::new(game_tip.clone()).build(window, cx)
+                        })
+                        .child(
+                            entry.game.clone().unwrap_or_else(|| "no game".to_owned()),
+                        ),
+                ),
+        )
+}
+
+/// Viewers as `viewers/collaboration`, with dashes for unknowns.
+fn viewers_text(entry: &ChannelStatus) -> String {
+    let viewers = entry
+        .viewers
+        .map_or("—".to_owned(), |viewers| viewers.to_string());
+    let collab = entry
+        .collaboration_viewers
+        .map_or("—".to_owned(), |collab| collab.to_string());
+    format!("{viewers}/{collab}")
+}
+
+/// Millis-since-epoch to `YYYY-MM-DDTHH:MM:SS.mmmZ` without a date crate.
+/// `None` (offline, never started) renders as an em dash.
+fn format_stream_start(start: Option<i64>) -> String {
+    let Some(millis) = start.filter(|millis| *millis >= 0) else {
+        return "—".to_owned();
+    };
+    let secs = millis / 1000;
+    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
+    let time = secs.rem_euclid(86_400);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        time / 3600,
+        time % 3600 / 60,
+        time % 60,
+        millis % 1000,
+    )
+}
+
+/// Days since 1970-01-01 to calendar date.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    (
+        if month <= 2 { year + 1 } else { year },
+        month,
+        day,
+    )
+}
+
+fn word_list(view: &SiphonView, _cx: &mut Context<SiphonView>) -> impl IntoElement {    let mut row = div().flex().flex_row().flex_wrap().gap_1();
     for (index, word) in view.frame.config.filtered_words.iter().enumerate() {
         let ui_tx = view.ui_tx.clone();
         let label = format!("{word} ×");
@@ -518,22 +656,97 @@ fn input_row(view: &SiphonView, _cx: &mut Context<SiphonView>) -> impl IntoEleme
         )
 }
 
-fn toggles(view: &SiphonView) -> impl IntoElement {
-    let ui_tx = view.ui_tx.clone();
-    let notify = Checkbox::new("notify-titles")
-        .label("Notify on title changes while offline")
-        .checked(view.frame.config.notify_title_changes)
-        .on_click(move |checked: &bool, _, _| {
-            let _ = ui_tx.send(UiIntent::SetNotifyTitleChanges(*checked));
-        });
-    let ui_tx = view.ui_tx.clone();
-    let sound = Checkbox::new("sound")
-        .label("Notification sound")
-        .checked(view.frame.config.sound)
-        .on_click(move |checked: &bool, _, _| {
-            let _ = ui_tx.send(UiIntent::SetSound(*checked));
-        });
-    div().flex().flex_col().gap_1().child(notify).child(sound)
+fn toggles(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoElement {
+    let theme = Theme::global(cx);
+    let dark = theme.is_dark();
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .text_color(theme.foreground)
+        .child(toggle_row(
+            "notify-titles",
+            "Notify on title changes while offline",
+            view.frame.config.notify_title_changes,
+            dark,
+            view.ui_tx.clone(),
+            UiIntent::SetNotifyTitleChanges,
+        ))
+        .child(toggle_row(
+            "sound",
+            "Notification sound",
+            view.frame.config.sound,
+            dark,
+            view.ui_tx.clone(),
+            UiIntent::SetSound,
+        ))
+}
+
+/// Solid-fill box colors, picked per theme mode so the state reads at a
+/// glance: green when checked, monochrome when not. The tick contrasts
+/// with the checked fill it sits on.
+const CHECKED_FILL_LIGHT: u32 = 0x16_6534;
+const CHECKED_FILL_DARK: u32 = 0x4a_de80;
+const UNCHECKED_FILL_LIGHT: u32 = 0x00_0000;
+const UNCHECKED_FILL_DARK: u32 = 0xff_ffff;
+const TICK_ON_DARK_GREEN: u32 = 0xff_ffff;
+const TICK_ON_LIGHT_GREEN: u32 = 0x00_0000;
+
+/// One labeled toggle on the unstyled base checkbox, which keeps toggle,
+/// focus, keyboard, and accessibility behavior while the app owns every
+/// pixel of the box.
+fn toggle_row(
+    id: &'static str,
+    label: &'static str,
+    checked: bool,
+    dark: bool,
+    ui_tx: Sender<UiIntent>,
+    intent: fn(bool) -> UiIntent,
+) -> impl IntoElement {
+    let fill = if checked {
+        if dark {
+            CHECKED_FILL_DARK
+        } else {
+            CHECKED_FILL_LIGHT
+        }
+    } else if dark {
+        UNCHECKED_FILL_DARK
+    } else {
+        UNCHECKED_FILL_LIGHT
+    };
+    let tick = if dark {
+        TICK_ON_LIGHT_GREEN
+    } else {
+        TICK_ON_DARK_GREEN
+    };
+    Checkbox::new(id)
+        .checked(checked)
+        .accessibility_label(label)
+        .on_change(move |state, _event, _window, _cx| {
+            let _ = ui_tx.send(intent(matches!(state, CheckboxState::Checked)));
+        })
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .child(
+            CheckboxIndicator::new()
+                .checked(checked)
+                .size_4()
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_shrink_0()
+                .border_1()
+                .rounded(px(4.))
+                .bg(rgb(fill))
+                .border_color(rgb(fill))
+                .text_color(rgb(tick))
+                .text_sm()
+                .child(if checked { div().child("✓") } else { div() }),
+        )
+        .child(div().child(label.to_owned()))
 }
 
 fn error_row(view: &SiphonView) -> impl IntoElement {
@@ -557,11 +770,11 @@ fn error_row(view: &SiphonView) -> impl IntoElement {
         }))
 }
 
-fn connection_text(status: Option<&StatusSnapshot>) -> (&str, u32) {
-    match status {
-        Some(snapshot) if snapshot.connected => ("Connected", GREEN),
-        Some(snapshot) => (snapshot.error.as_deref().unwrap_or("Connecting…"), RED),
-        None => ("Connecting…", GRAY),
+fn connection_text(connected: bool, error: Option<&str>) -> (&str, u32) {
+    if connected {
+        ("Connected", GREEN)
+    } else {
+        (error.unwrap_or("Connecting…"), RED)
     }
 }
 
@@ -585,6 +798,47 @@ fn win_hwnd(window: &Window) -> Option<isize> {
             RawWindowHandle::Win32(win) => Some(win.hwnd.get()),
             _ => None,
         })
+}
+
+/// Assigns the bundled icon to our own window for the taskbar and title
+/// bar; wgpui exposes no icon API, so this goes through `WM_SETICON`
+/// directly. Returns the icon for the view to own: the window only stores
+/// the handle, so freeing it would blank the icon.
+fn set_window_icon(hwnd: isize) -> Option<HICON> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging as wam;
+
+    let icon = match crate::tray::load_icon() {
+        Ok(icon) => icon,
+        Err(error) => {
+            log::error!(target: "app", "window icon load failed: {error}");
+            return None;
+        }
+    };
+    // SAFETY: `hwnd` is our own live window; `WM_SETICON` only stores the
+    // handle for the shell to paint.
+    unsafe {
+        wam::SendMessageW(
+            hwnd as HWND,
+            wam::WM_SETICON,
+            wam::ICON_SMALL as WPARAM,
+            icon as LPARAM,
+        );
+        wam::SendMessageW(hwnd as HWND, wam::WM_SETICON, wam::ICON_BIG as WPARAM, icon as LPARAM);
+    }
+    Some(icon)
+}
+
+impl Drop for SiphonView {
+    fn drop(&mut self) {
+        if let Some(icon) = self.window_icon {
+            use windows_sys::Win32::UI::WindowsAndMessaging as wam;
+
+            // SAFETY: icon installed by `set_window_icon` and owned by
+            // this view.
+            unsafe { wam::DestroyIcon(icon) };
+        }
+    }
 }
 
 /// The close button hides to the tray; without a tray it would strand
@@ -640,5 +894,32 @@ fn show_window(hwnd: isize) {
     unsafe {
         wam::ShowWindow(hwnd as HWND, wam::SW_SHOWDEFAULT);
         wam::SetForegroundWindow(hwnd as HWND);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_stream_start;
+
+    #[test]
+    fn stream_start_formats_utc() {
+        assert_eq!(format_stream_start(None), "—");
+        assert_eq!(format_stream_start(Some(-1)), "—");
+        assert_eq!(
+            format_stream_start(Some(0)),
+            "1970-01-01T00:00:00.000Z"
+        );
+        assert_eq!(
+            format_stream_start(Some(1_000_000_000_000)),
+            "2001-09-09T01:46:40.000Z"
+        );
+        assert_eq!(
+            format_stream_start(Some(1_709_208_000_000)),
+            "2024-02-29T12:00:00.000Z"
+        );
+        assert_eq!(
+            format_stream_start(Some(1_788_237_802_868)),
+            "2026-09-01T04:43:22.868Z"
+        );
     }
 }

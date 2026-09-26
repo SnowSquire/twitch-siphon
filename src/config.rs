@@ -1,10 +1,9 @@
 use std::path::Path;
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// A single tracked channel. Only resolved channels are ever stored; a login
-/// that fails to resolve lives for the session only and never hits the disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -13,15 +12,10 @@ pub struct Channel {
     pub display_name: Option<String>,
 }
 
-/// On-disk config. `version` dispatches decoding: a file stamped with a newer
-/// version than this build understands is discarded (fresh default) rather
-/// than misinterpreted, while older files run one migration step per version
-/// with their data preserved. Files without a version predate versioning and
-/// decode as version 0.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Config {
-    pub version: u32,
+    pub version: u64,
     pub channels: Vec<Channel>,
     pub notify_title_changes: bool,
     pub sound: bool,
@@ -41,12 +35,8 @@ impl Default for Config {
 }
 
 impl Config {
-    pub const VERSION: u32 = 2;
+    pub const VERSION: u64 = 2;
 
-    /// Synchronous on purpose: the single call site is `main`, on the GUI
-    /// thread before any runtime exists, where blocking is harmless. The
-    /// runtime path ([`WorkState`](crate::state::WorkState)) only saves.
-    /// Anything undecodable yields a fresh default.
     pub fn load(path: &Path) -> Self {
         match Self::load_versioned(path) {
             Ok(config) => config,
@@ -57,28 +47,24 @@ impl Config {
         }
     }
 
-    /// Decodes the file by version dispatch: the stamp is read before any
-    /// typed decoding, so shapes that no longer parse still migrate. Newer
-    /// files are refused; older ones run one [`migrate_step`] per version
-    /// until current, and only the result decodes into [`Config`].
     fn load_versioned(path: &Path) -> anyhow::Result<Self> {
-        let bytes = std::fs::read(path)?;
-        let mut value: Value = serde_json::from_slice(&bytes)?;
+        let mut value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
         let from = value.get("version").and_then(Value::as_u64).unwrap_or(0);
-        if from > u64::from(Self::VERSION) {
+        if from > Self::VERSION {
             return Err(anyhow::anyhow!("ignoring config version {from}"));
         }
+
         let map = value
             .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("config root is not an object"))?;
-        let mut version = from;
-        while version < u64::from(Self::VERSION) {
+            .context("config root is not an object")?;
+
+        for version in from..Self::VERSION {
             migrate_step(map, version)?;
-            version += 1;
-            map.insert("version".to_owned(), Value::from(version));
+            map.insert("version".to_owned(), Value::from(version + 1));
         }
-        let config: Self = serde_json::from_value(Value::Object(map.clone()))?;
-        if from < u64::from(Self::VERSION) {
+
+        let config: Self = serde_json::from_value(value)?;
+        if from < Self::VERSION {
             log::info!(
                 target: "config",
                 "migrated config version {from} to {}",
@@ -88,9 +74,6 @@ impl Config {
         Ok(config)
     }
 
-    /// Async so the work-thread runtime (thread-per-core) never blocks on
-    /// disk: one chunked write straight from the serialized string, with no
-    /// intermediate buffer beyond it.
     pub async fn save(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             compio::fs::create_dir_all(parent).await?;
@@ -101,12 +84,6 @@ impl Config {
     }
 }
 
-/// Advances `map` from exactly `version` to `version + 1`, preserving
-/// everything already present. Add one arm per new version; the loop in
-/// [`Config::load_versioned`] applies them in order until current, so a file
-/// any number of versions behind still converges. The coverage test below
-/// calls every version in `0..VERSION`, so bumping `VERSION` without adding
-/// its arm fails `cargo test`.
 fn migrate_step(map: &mut Map<String, Value>, version: u64) -> anyhow::Result<()> {
     match version {
         // v0 predates versioning but shares v1's shape: stamping (done by the
@@ -123,7 +100,9 @@ fn migrate_step(map: &mut Map<String, Value>, version: u64) -> anyhow::Result<()
             // Programmer error, not user data: the coverage test catches it,
             // and release builds still fall back to a fresh default below.
             debug_assert!(false, "missing migration from config version {version}");
-            Err(anyhow::anyhow!("no migration from config version {version}"))
+            Err(anyhow::anyhow!(
+                "no migration from config version {version}"
+            ))
         }
     }
 }
@@ -181,7 +160,7 @@ mod tests {
 
     #[test]
     fn migrate_step_covers_every_version_below_current() {
-        for version in 0..u64::from(Config::VERSION) {
+        for version in 0..Config::VERSION {
             let mut map = Map::new();
             assert!(
                 migrate_step(&mut map, version).is_ok(),
