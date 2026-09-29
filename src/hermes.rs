@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use crate::balesh::NanoId;
 use crate::http::{self, StreamGame};
 use crate::matcher::Matcher;
-use crate::state::{ChannelRow, ConnectOutcome, JobDone, SubscriptionState, Worker};
+use crate::state::{ConnectOutcome, JobDone, SubEntry, SubState, Worker};
 
 const HERMES_URL: &str = "wss://hermes.twitch.tv/v1?clientId=kimne78kx3ncx6brgo4mv6wki5h1ko";
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -176,10 +176,7 @@ impl Worker {
         {
             let snapshot = self.shared.read();
             for channel in &fresh {
-                let old = snapshot
-                    .channels
-                    .get(&channel.id)
-                    .map(|row| &row.channel);
+                let old = snapshot.channels.get(&channel.id);
                 if should_log_stream(old, channel) {
                     log::info!(
                         target: "hermes",
@@ -193,17 +190,11 @@ impl Worker {
             }
         }
         // One update for the whole baseline: reconnects re-resolve every
-        // channel, and each update wakes the pump. Rows keep their
-        // subscription states; only the resolved detail is replaced.
+        // channel, and each update wakes the pump.
         let ids: Vec<u64> = fresh.iter().map(|channel| channel.id).collect();
         self.shared.update(|snapshot| {
             for channel in fresh {
-                let id = channel.id;
-                if let Some(row) = snapshot.channels.get_mut(&id) {
-                    row.channel = channel;
-                } else {
-                    snapshot.channels.insert(id, ChannelRow::new(channel));
-                }
+                snapshot.channels.insert(channel.id, channel);
             }
         });
         for id in ids {
@@ -247,12 +238,7 @@ impl Worker {
     /// stream identity moved. Steady refreshes stay silent.
     pub(crate) fn track_channel(&mut self, user: http::ChannelDetail) {
         let id = user.id;
-        let old = self
-            .shared
-            .read()
-            .channels
-            .get(&id)
-            .map(|row| row.channel.clone());
+        let old = self.shared.read().channels.get(&id).cloned();
         if should_log_stream(old.as_ref(), &user) {
             log::info!(
                 target: "hermes",
@@ -263,50 +249,46 @@ impl Worker {
                 user.stream_created_at.as_deref().unwrap_or("none"),
             );
         }
-        // A fresh resolve replaces the row but keeps the subscription
-        // states: reconnects must not reset badges the server accepted.
+        // A fresh resolve replaces the row.
         self.shared.update(|snapshot| {
-            if let Some(row) = snapshot.channels.get_mut(&id) {
-                row.channel = user;
-            } else {
-                snapshot.channels.insert(id, ChannelRow::new(user));
-            }
+            snapshot.channels.insert(id, user);
         });
     }
 
     /// Registers a channel's two topics if not registered already. Entries
     /// persist across reconnects; every welcome replays the whole map.
-    /// Rows keep their states: a fresh row already starts Pending.
     pub(crate) fn ensure_subs(&mut self, id: u64) {
         for topic in Topic::for_channel(id) {
             if !self.sub_ids.contains_key(&topic) {
-                let sub_id = self.rng.nano_id();
-                self.sub_ids.insert(topic, sub_id);
+                self.sub_ids.insert(
+                    topic,
+                    SubEntry {
+                        sub_id: self.rng.nano_id(),
+                        attempt: 0,
+                        state: SubState::Pending,
+                    },
+                );
             }
         }
     }
 
-    /// Takes one channel's topics out of the map, returning their
-    /// subscription ids for unsubscribing.
-    pub(crate) fn take_channel_subs(&mut self, id: u64) -> Vec<(NanoId, Topic)> {
-        Topic::for_channel(id)
-            .into_iter()
-            .filter_map(|topic| self.sub_ids.remove(&topic).map(|sub_id| (sub_id, topic)))
-            .collect()
-    }
-
-    /// Drops one id's row and topics without touching the socket: the
-    /// channel is gone (deleted/renamed), so there is nothing to
-    /// unsubscribe from that the server would still recognize. Welcome
-    /// replays never see it again.
-    pub(crate) fn drop_channel(&mut self, id: u64) {
+    /// Drops one id's row and topics, returning the removed subscriptions
+    /// for unsubscribing. The socket is untouched: the channel is gone
+    /// (deleted/renamed), so the server would not recognize an unsubscribe
+    /// from pruned ids — removals send them, prunes ignore them. Welcome
+    /// replays never see the id again.
+    pub(crate) fn drop_channel(&mut self, id: u64) -> Vec<(NanoId, Topic)> {
         self.quiet_until.remove(&id);
+        let mut removed = Vec::new();
         for topic in Topic::for_channel(id) {
-            self.sub_ids.remove(&topic);
+            if let Some(entry) = self.sub_ids.remove(&topic) {
+                removed.push((entry.sub_id, topic));
+            }
         }
         self.shared.update(|snapshot| {
             snapshot.channels.remove(&id);
         });
+        removed
     }
 
     /// Drops the socket and backs off. Reconnects always start fresh and
@@ -404,34 +386,20 @@ impl Worker {
                     return;
                 };
                 let ok = message["subscribeResponse"]["result"].as_str() == Some("ok");
-                let Some(topic) = self.sub_ids.iter().find_map(|(topic, sub_id)| {
-                    (*sub_id == target).then_some(*topic)
+                let Some(topic) = self.sub_ids.iter().find_map(|(topic, entry)| {
+                    (entry.sub_id == target).then_some(*topic)
                 }) else {
                     return;
                 };
-                let (id, is_title) = match topic {
-                    Topic::BroadcastSettingsUpdate(id) => (id, true),
-                    Topic::VideoPlaybackById(id) => (id, false),
-                };
-                let state = if ok {
-                    SubscriptionState::Connected
+                if let Some(entry) = self.sub_ids.get_mut(&topic) {
+                    entry.state = if ok { SubState::Accepted } else { SubState::Rejected };
+                }
+                if ok {
+                    log::info!(target: "hermes", "subscription to {topic} accepted");
                 } else {
-                    SubscriptionState::Failed
-                };
-                self.shared.update(|snapshot| {
-                    if let Some(row) = snapshot.channels.get_mut(&id) {
-                        if is_title {
-                            row.title = state;
-                        } else {
-                            row.live = state;
-                        }
-                    }
-                });
-                log::info!(
-                    target: "hermes",
-                    "subscription to {topic} {}",
-                    if ok { "accepted" } else { "rejected" }
-                );
+                    log::info!(target: "hermes", "subscription to {topic} rejected");
+                    self.set_error(format!("subscription to {topic} rejected"));
+                }
                 self.publish_conn_health(None);
             }
             Some("unsubscribeResponse") => {
@@ -443,39 +411,53 @@ impl Worker {
     }
 
     async fn resubscribe_all(&mut self) {
-        log::info!(target: "hermes", "replaying {} topic(s)", self.sub_ids.len());
-        let pending: Vec<(NanoId, Topic)> = self
+        let pairs: Vec<(NanoId, Topic)> = self
             .sub_ids
             .iter()
-            .map(|(topic, sub_id)| (*sub_id, *topic))
+            .map(|(topic, entry)| (entry.sub_id, *topic))
             .collect();
-        self.shared.update(|snapshot| {
-            for row in snapshot.channels.values_mut() {
-                row.title = SubscriptionState::Pending;
-                row.live = SubscriptionState::Pending;
-            }
-        });
-        for (sub_id, topic) in pending {
-            self.send_subscribe(sub_id, topic).await;
-        }
+        self.subscribe(&pairs).await;
     }
 
     /// Subscribes a single channel's topics; used when a channel is added
     /// to an already-live session (welcomes replay everything instead).
     pub(crate) async fn subscribe_channel(&mut self, id: u64) {
-        let pending: Vec<(NanoId, Topic)> = Topic::for_channel(id)
+        let pairs: Vec<(NanoId, Topic)> = Topic::for_channel(id)
             .into_iter()
-            .filter_map(|topic| self.sub_ids.get(&topic).map(|sub_id| (*sub_id, topic)))
+            .filter_map(|topic| {
+                self.sub_ids
+                    .get(&topic)
+                    .map(|entry| (entry.sub_id, topic))
+            })
             .collect();
-        if !pending.is_empty() {
+        self.subscribe(&pairs).await;
+    }
+
+    /// Sends subscribes for already-registered topics and arms one
+    /// confirmation deadline per topic: a timeout whose entry is still
+    /// `Pending` (same id, same send) surfaces an error and leaves the
+    /// entry for the reconnect replay to retry.
+    async fn subscribe(&mut self, pairs: &[(NanoId, Topic)]) {
+        if !pairs.is_empty() {
             log::info!(
                 target: "hermes",
-                "subscribing {} topic(s) for {id}",
-                pending.len()
+                "subscribing to {} topic(s)",
+                pairs.len()
             );
         }
-        for (sub_id, topic) in pending {
+        for &(sub_id, topic) in pairs {
+            self.sub_gen += 1;
+            let attempt = self.sub_gen;
+            if let Some(entry) = self.sub_ids.get_mut(&topic) {
+                entry.attempt = attempt;
+                entry.state = SubState::Pending;
+            }
             self.send_subscribe(sub_id, topic).await;
+            let timeout = async move {
+                compio::time::sleep(WELCOME_TIMEOUT).await;
+                JobDone::SubscribeCheckDue(topic, sub_id, attempt)
+            };
+            self.jobs.push(Box::pin(timeout));
         }
     }
 
@@ -512,22 +494,18 @@ impl Worker {
         else {
             return;
         };
-        let Some(topic) = self.sub_ids.iter().find_map(|(topic, sub_id)| {
-            (*sub_id == target).then_some(*topic)
+        let Some(topic) = self.sub_ids.iter().find_map(|(topic, entry)| {
+            (entry.sub_id == target).then_some(*topic)
         }) else {
             return;
         };
-        let (id, is_title) = match topic {
-            Topic::BroadcastSettingsUpdate(id) => (id, true),
-            Topic::VideoPlaybackById(id) => (id, false),
-        };
-        let state = {
-            let snapshot = self.shared.read();
-            snapshot.channels.get(&id).map_or(SubscriptionState::Pending, |row| {
-                if is_title { row.title } else { row.live }
-            })
-        };
-        if state != SubscriptionState::Connected {
+        // Only confirmed subscriptions notify: welcomes replay everything,
+        // and confirmations arrive after.
+        let confirmed = matches!(
+            self.sub_ids.get(&topic),
+            Some(entry) if entry.state == SubState::Accepted
+        );
+        if !confirmed {
             return;
         }
         let Ok(pubsub) =
@@ -572,8 +550,7 @@ impl Worker {
         // The row mutates and publishes through the slot, so title and
         // game changes reach the GUI without a separate publish.
         let toast = self.shared.update(|snapshot| {
-            let row = snapshot.channels.get_mut(&id)?;
-            let user = &mut row.channel;
+            let user = snapshot.channels.get_mut(&id)?;
             let title_changed = user.stream_title.as_deref() != Some(status.as_str());
             let game_changed = game.as_deref() != user.game.as_ref().map(|game| game.name.as_str());
             let can_notify = notify_titles && !user.live && !quiet;
@@ -638,13 +615,13 @@ impl Worker {
                     return;
                 }
                 self.shared.update(|snapshot| {
-                    if let Some(row) = snapshot.channels.get_mut(&id) {
-                        row.channel.viewers = pubsub["viewers"]
+                    if let Some(user) = snapshot.channels.get_mut(&id) {
+                        user.viewers = pubsub["viewers"]
                             .as_u64()
                             .and_then(|x| u32::try_from(x).ok());
-                        row.channel.collaboration_viewers = None;
+                        user.collaboration_viewers = None;
                         if pubsub["collaboration_status"].as_str() == Some("in_collaboration") {
-                            row.channel.collaboration_viewers = pubsub["collaboration_viewers"]
+                            user.collaboration_viewers = pubsub["collaboration_viewers"]
                                 .as_u64()
                                 .and_then(|x| u32::try_from(x).ok());
                         }
@@ -657,14 +634,14 @@ impl Worker {
                 // still flips live and refreshes, only the toast is skipped.
                 let quiet = self.quiet(id);
                 let cached = self.shared.update(|snapshot| {
-                    snapshot.channels.get_mut(&id).map(|row| {
-                        row.channel.live = true;
+                    snapshot.channels.get_mut(&id).map(|user| {
+                        user.live = true;
                         (
-                            row.channel.login.clone(),
-                            row.channel.display_name.clone(),
-                            row.channel.game.clone(),
-                            row.channel.stream_title.clone(),
-                            row.channel.profile_image_url.clone(),
+                            user.login.clone(),
+                            user.display_name.clone(),
+                            user.game.clone(),
+                            user.stream_title.clone(),
+                            user.profile_image_url.clone(),
                         )
                     })
                 });
@@ -712,10 +689,10 @@ impl Worker {
                 self.quiet_until
                     .insert(id, Instant::now() + OFFLINE_QUIET);
                 self.shared.update(|snapshot| {
-                    if let Some(row) = snapshot.channels.get_mut(&id) {
-                        row.channel.live = false;
-                        row.channel.collaboration_viewers = None;
-                        row.channel.viewers = None;
+                    if let Some(user) = snapshot.channels.get_mut(&id) {
+                        user.live = false;
+                        user.collaboration_viewers = None;
+                        user.viewers = None;
                     }
                 });
             }
@@ -816,8 +793,10 @@ fn should_log_stream(old: Option<&http::ChannelDetail>, new: &http::ChannelDetai
 
 #[cfg(test)]
 mod tests {
+    use super::Topic;
+    use crate::balesh::NanoId;
     use crate::config::Config;
-    use crate::state::{SharedSnapshot, Snapshot, Worker, WorkerInit};
+    use crate::state::{JobDone, SharedSnapshot, Snapshot, Worker, WorkerInit};
 
     fn test_worker(filtered_words: &[&str]) -> Worker {
         let config = Config {
@@ -834,6 +813,84 @@ mod tests {
             tray_rx,
             shared,
         })
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        compio::runtime::Runtime::new().unwrap().block_on(future)
+    }
+
+    fn sub_pairs(worker: &Worker) -> Vec<(NanoId, Topic)> {
+        worker
+            .sub_ids
+            .iter()
+            .map(|(topic, entry)| (entry.sub_id, *topic))
+            .collect()
+    }
+
+    fn confirm(worker: &mut Worker, sub_id: NanoId, ok: bool) {
+        let body = serde_json::json!({
+            "type": "subscribeResponse",
+            "subscribeResponse": {
+                "subscription": { "id": sub_id.to_string() },
+                "result": if ok { "ok" } else { "rejected" },
+            },
+        });
+        block_on(worker.handle_message(&body.to_string()));
+    }
+
+    fn check_due(worker: &mut Worker, topic: Topic, sub_id: NanoId, attempt: u64) {
+        block_on(worker.handle_job(JobDone::SubscribeCheckDue(topic, sub_id, attempt)));
+    }
+
+    #[test]
+    fn subscribe_timeout_reports_only_still_pending_attempts() {
+        let mut worker = test_worker(&[]);
+        worker.ensure_subs(7);
+        let pairs = sub_pairs(&worker);
+        block_on(worker.subscribe(&pairs));
+        let (topic, sub_id, attempt) = {
+            let (topic, entry) = worker.sub_ids.iter().next().expect("registered");
+            (*topic, entry.sub_id, entry.attempt)
+        };
+
+        // Still pending at the deadline: surfaces an error, entry kept.
+        check_due(&mut worker, topic, sub_id, attempt);
+        assert!(
+            worker.shared.read().error.contains("not confirmed"),
+            "was: {}",
+            worker.shared.read().error
+        );
+        assert!(worker.sub_ids.contains_key(&topic));
+
+        // A confirmation silences even the already-fired deadline.
+        worker.shared.update(|state| state.error.clear());
+        confirm(&mut worker, sub_id, true);
+        check_due(&mut worker, topic, sub_id, attempt);
+        assert!(worker.shared.read().error.is_empty());
+
+        // A resend is a new attempt: the old deadline stays silent.
+        let pairs = sub_pairs(&worker);
+        block_on(worker.subscribe(&pairs));
+        let next = worker.sub_ids[&topic].attempt;
+        assert_ne!(next, attempt);
+        check_due(&mut worker, topic, sub_id, attempt);
+        assert!(worker.shared.read().error.is_empty());
+
+        // The new deadline still guards the new attempt.
+        check_due(&mut worker, topic, sub_id, next);
+        assert!(worker.shared.read().error.contains("not confirmed"));
+
+        // A rejection surfaces immediately and exactly once.
+        worker.shared.update(|state| state.error.clear());
+        confirm(&mut worker, sub_id, false);
+        assert!(
+            worker.shared.read().error.contains("rejected"),
+            "was: {}",
+            worker.shared.read().error
+        );
+        worker.shared.update(|state| state.error.clear());
+        check_due(&mut worker, topic, sub_id, next);
+        assert!(worker.shared.read().error.is_empty());
     }
 
     #[test]

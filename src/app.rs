@@ -3,7 +3,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::HICON;
 use wgpui::{
     App, AsyncApp, Context, Entity, Render, Subscription, Window, div, prelude::*, px, rgb,
 };
-use wgpui_kit::base::Disableable as _;
 use wgpui_kit::base::{Checkbox, CheckboxIndicator, CheckboxState};
 use wgpui_kit::component::Root;
 use wgpui_kit::component::button::Button;
@@ -12,12 +11,12 @@ use wgpui_kit::component::scroll::ScrollableElement as _;
 use wgpui_kit::component::theme::{Theme, ThemeMode};
 use wgpui_kit::component::tooltip::Tooltip;
 
-use crate::state::{ChannelRow, GuiEvent, SharedSnapshot, Snapshot, SubscriptionState, UiIntent, UpdateStatus};
+use crate::http::ChannelDetail;
+use crate::state::{GuiEvent, SharedSnapshot, Snapshot, UiIntent};
 use crate::tray::{Tray, TrayAction};
 
 const GREEN: u32 = 0x2e_a043;
 const RED: u32 = 0xda_3633;
-const GRAY: u32 = 0x6e_7681;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum Tab {
@@ -362,21 +361,15 @@ fn header(view: &SiphonView, _cx: &mut Context<SiphonView>) -> impl IntoElement 
         .child(div().text_xl().child("Siphon"))
         .child(connection(view));
 
-    match &view.snapshot.update {
-        UpdateStatus::Available(offer) => {
-            let ui_tx = view.ui_tx.clone();
-            row = row.child(
-                Button::new("update")
-                    .label(format!("Update to {}", offer.version))
-                    .on_click(move |_, _, _| {
-                        let _ = ui_tx.send(UiIntent::ApplyUpdate);
-                    }),
-            );
-        }
-        UpdateStatus::Downloading(_) => {
-            row = row.child(Button::new("update").label("Updating…").disabled(true));
-        }
-        UpdateStatus::Idle | UpdateStatus::Checking | UpdateStatus::Current => {}
+    if let Some(offer) = &view.snapshot.update {
+        let ui_tx = view.ui_tx.clone();
+        row = row.child(
+            Button::new("update")
+                .label(format!("Update to {}", offer.version))
+                .on_click(move |_, _, _| {
+                    let _ = ui_tx.send(UiIntent::ApplyUpdate);
+                }),
+        );
     }
     row
 }
@@ -421,19 +414,20 @@ fn channel_list(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoEle
             .flex_row()
             .gap_2()
             .child(div().flex_1().child("Channel"))
-            .child(div().w(px(110.)).child("Live Status"))
-            .child(div().w(px(110.)).child("Title Status"))
+            .child(div().flex_1().child("Title"))
+            .child(div().w(px(90.)).child("Viewers"))
             .child(div().w(px(36.)).child("")),
     );
     for channel in &view.snapshot.config.channels {
         let resolved = view.snapshot.channels.get(&channel.id);
         let name = resolved
-            .map(|entry| entry.channel.display_name.as_str())
+            .map(|entry| entry.display_name.as_str())
             .or(channel.display_name.as_deref())
             .unwrap_or(channel.login.as_str());
-        let (live, title) = resolved.map_or((SubscriptionState::Pending, SubscriptionState::Pending), |entry| {
-            (entry.live, entry.title)
-        });
+        let title = resolved
+            .and_then(|entry| entry.stream_title.clone())
+            .unwrap_or_default();
+        let viewers = resolved.map_or("—".to_owned(), live_viewers);
         let id = channel.id;
         let login = channel.login.clone();
         let ui_tx = view.ui_tx.clone();
@@ -451,7 +445,8 @@ fn channel_list(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoEle
                 .child(name.to_owned()),
         );
         // The detail renders below the row, never inside it, so the name,
-        // badges, and close button keep their positions when it opens.
+        // title, viewers, and close button keep their positions when it
+        // opens.
         let mut wrapper = div().flex().flex_col().gap_1().child(
             div()
                 .flex()
@@ -459,8 +454,8 @@ fn channel_list(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoEle
                 .gap_2()
                 .items_center()
                 .child(name_cell)
-                .child(div().w(px(110.)).child(sub_badge(live)))
-                .child(div().w(px(110.)).child(sub_badge(title)))
+                .child(div().flex_1().child(title.clone()))
+                .child(div().w(px(90.)).child(viewers.clone()))
                 .child(Button::new(format!("remove-{id}")).label("×").on_click(
                     move |_, _, _| {
                         log::info!(target: "app", "remove requested for {login}");
@@ -481,8 +476,8 @@ fn channel_list(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoEle
                 .gap_2()
                 .items_center()
                 .child(div().flex_1().child(login.clone()))
-                .child(div().w(px(110.)).child(sub_badge(SubscriptionState::Pending)))
-                .child(div().w(px(110.)).child(sub_badge(SubscriptionState::Pending)))
+                .child(div().flex_1().child("…"))
+                .child(div().w(px(90.)).child("…"))
                 .child(div().w(px(36.)).child("…")),
         );
     }
@@ -494,8 +489,7 @@ fn channel_list(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoEle
 /// The muted background groups it with the row above. Hovering the login
 /// shows the channel id, hovering the title shows the stream id, hovering
 /// the game shows the game id.
-fn channel_detail(entry: &ChannelRow, cx: &App) -> impl IntoElement {
-    let channel = &entry.channel;
+fn channel_detail(channel: &ChannelDetail, cx: &App) -> impl IntoElement {
     let channel_tip = format!("id {}", channel.id);
     let stream_tip = if channel.stream_id == 0 {
         "no stream".to_owned()
@@ -553,7 +547,7 @@ fn channel_detail(entry: &ChannelRow, cx: &App) -> impl IntoElement {
                                 .unwrap_or_else(|| "no title".to_owned()),
                         ),
                 )
-                .child(div().child(viewers_text(entry))),
+                .child(div().child(viewers_text(channel))),
         )
         .child(
             div()
@@ -573,14 +567,24 @@ fn channel_detail(entry: &ChannelRow, cx: &App) -> impl IntoElement {
         )
 }
 
+/// Collapsed-row liveness: `offline` when the channel is offline, the
+/// viewer count when live. The count also changes while the connection
+/// is healthy, so a frozen row reads as a stalled connection.
+fn live_viewers(channel: &ChannelDetail) -> String {
+    if !channel.live {
+        return "offline".to_owned();
+    }
+    channel
+        .viewers
+        .map_or("—".to_owned(), |viewers| viewers.to_string())
+}
+
 /// Viewers as `viewers/collaboration`, with dashes for unknowns.
-fn viewers_text(entry: &ChannelRow) -> String {
-    let viewers = entry
-        .channel
+fn viewers_text(channel: &ChannelDetail) -> String {
+    let viewers = channel
         .viewers
         .map_or("—".to_owned(), |viewers| viewers.to_string());
-    let collab = entry
-        .channel
+    let collab = channel
         .collaboration_viewers
         .map_or("—".to_owned(), |collab| collab.to_string());
     format!("{viewers}/{collab}")
@@ -592,39 +596,7 @@ fn format_stream_start(start: Option<i64>) -> String {
     let Some(millis) = start.filter(|millis| *millis >= 0) else {
         return "—".to_owned();
     };
-    let secs = millis / 1000;
-    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
-    let time = secs.rem_euclid(86_400);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
-        time / 3600,
-        time % 3600 / 60,
-        time % 60,
-        millis % 1000,
-    )
-}
-
-/// Days since 1970-01-01 to calendar date.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let shifted = days + 719_468;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = if month_prime < 10 {
-        month_prime + 3
-    } else {
-        month_prime - 9
-    };
-    (
-        if month <= 2 { year + 1 } else { year },
-        month,
-        day,
-    )
+    crate::logging::format_iso_ms(millis)
 }
 
 fn word_list(view: &SiphonView, _cx: &mut Context<SiphonView>) -> impl IntoElement {    let mut row = div().flex().flex_row().flex_wrap().gap_1();
@@ -784,15 +756,6 @@ fn connection_text(connected: bool, error: Option<&str>) -> (&str, u32) {
     } else {
         (error.unwrap_or("Connecting…"), RED)
     }
-}
-
-fn sub_badge(state: SubscriptionState) -> impl IntoElement {
-    let (text, color) = match state {
-        SubscriptionState::Pending => ("Pending", GRAY),
-        SubscriptionState::Connected => ("Connected", GREEN),
-        SubscriptionState::Failed => ("Failed", RED),
-    };
-    div().text_color(rgb(color)).child(text)
 }
 
 /// Raw Win32 handle for our own window. wgpui exposes no hide API, so

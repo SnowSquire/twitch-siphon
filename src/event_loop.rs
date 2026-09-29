@@ -10,7 +10,7 @@ use futures_util::{FutureExt as _, StreamExt as _};
 
 use crate::config::Channel;
 use crate::http;
-use crate::state::{JobDone, JobFuture, UiIntent, UpdateStatus, Worker};
+use crate::state::{JobDone, JobFuture, SubState, UiIntent, Worker};
 use crate::tray::TrayAction;
 use crate::update;
 
@@ -128,27 +128,22 @@ impl Worker {
             }
             JobDone::ToastShown => {}
             JobDone::UpdateCheckFinished(result) => {
-                // A click may have moved on to `Downloading` while the
-                // check was in flight; only `Checking` still wants this.
-                if !matches!(self.shared.read().update, UpdateStatus::Checking) {
-                    return;
-                }
+                self.update_busy = false;
                 match result {
                     Ok(release) => {
-                        self.shared.update(|state| {
-                            state.update = if update::newer_than_current(&release) {
-                                log::info!(target: "update", "new release: {}", release.version);
-                                UpdateStatus::Available(release)
-                            } else {
-                                UpdateStatus::Current
-                            };
-                        });
+                        if update::newer_than_current(&release) {
+                            log::info!(target: "update", "new release: {}", release.version);
+                            self.shared.update(|state| {
+                                state.update = Some(release);
+                            });
+                        } else {
+                            self.shared.update(|state| {
+                                state.update = None;
+                            });
+                        }
                     }
                     Err(error) => {
                         log::info!(target: "update", "check failed: {error}");
-                        self.shared.update(|state| {
-                            state.update = UpdateStatus::Idle;
-                        });
                     }
                 }
                 self.push_update_wait();
@@ -156,6 +151,19 @@ impl Worker {
             JobDone::UpdateCheckDue => self.push_update_check(),
             JobDone::UpdateDownloadFinished(result) => {
                 self.finish_update_download(result);
+            }
+            JobDone::SubscribeCheckDue(topic, sub_id, attempt) => {
+                let unconfirmed = matches!(
+                    self.sub_ids.get(&topic),
+                    Some(entry)
+                        if entry.sub_id == sub_id
+                            && entry.attempt == attempt
+                            && entry.state == SubState::Pending
+                );
+                if unconfirmed {
+                    log::info!(target: "hermes", "subscription to {topic} not confirmed");
+                    self.set_error(format!("subscription to {topic} not confirmed"));
+                }
             }
             JobDone::ConnectFinished(outcome) => {
                 self.complete_connect(*outcome).await;
@@ -246,6 +254,11 @@ impl Worker {
         if stale {
             return;
         }
+        self.shared.update(|state| {
+            state
+                .pending
+                .retain(|item| !item.eq_ignore_ascii_case(&login));
+        });
         match result {
             Ok(Some(user)) => {
                 log::info!(
@@ -269,20 +282,17 @@ impl Worker {
                     id: user.id,
                     display_name: Some(user.display_name.clone()),
                 };
-                self.shared.update(|state| {
-                    state
-                        .pending
-                        .retain(|item| !item.eq_ignore_ascii_case(&login));
-                    if !duplicate {
+                if !duplicate {
+                    self.shared.update(|state| {
                         state.config.channels.push(channel);
-                    }
-                });
+                    });
+                }
                 if duplicate {
                     return;
                 }
                 // Track the resolved user so rows and notifications see
-                // it: without this the row keeps the Pending fallback
-                // until a reconnect re-baselines.
+                // it: without this the row is missing until a reconnect
+                // re-baselines.
                 self.track_channel(user);
                 self.queue_save();
                 self.ensure_subs(id);
@@ -295,20 +305,10 @@ impl Worker {
                     target: "config",
                     "gql returned no channel named {login}, is it a typo?"
                 );
-                self.shared.update(|state| {
-                    state
-                        .pending
-                        .retain(|item| !item.eq_ignore_ascii_case(&login));
-                });
                 self.set_error(format!("channel {login} not found"));
             }
             Err(error) => {
                 log::info!(target: "config", "channel resolution failed: {error}");
-                self.shared.update(|state| {
-                    state
-                        .pending
-                        .retain(|item| !item.eq_ignore_ascii_case(&login));
-                });
                 self.set_error(format!("failed to resolve {login}: {error}"));
             }
         }
@@ -318,8 +318,7 @@ impl Worker {
         self.shared.update(|state| {
             state.config.channels.retain(|channel| channel.id != id);
         });
-        self.drop_channel(id);
-        for (sub_id, topic) in self.take_channel_subs(id) {
+        for (sub_id, topic) in self.drop_channel(id) {
             log::info!(target: "hermes", "unsubscribing from {topic}");
             let message_id = self.rng.nano_id();
             self.send_message(&serde_json::json!({
@@ -433,15 +432,13 @@ impl Worker {
     }
 
     pub(crate) fn push_update_check(&mut self) {
-        if matches!(
-            self.shared.read().update,
-            UpdateStatus::Checking | UpdateStatus::Downloading(_)
-        ) {
+        if self.update_busy {
+            // A check or download is in flight; keep the periodic cycle
+            // alive so checks do not stall behind it.
+            self.push_update_wait();
             return;
         }
-        self.shared.update(|state| {
-            state.update = UpdateStatus::Checking;
-        });
+        self.update_busy = true;
         self.jobs.push(Box::pin(async move {
             JobDone::UpdateCheckFinished(update::fetch_latest().await)
         }));
@@ -455,19 +452,12 @@ impl Worker {
     }
 
     fn handle_apply_update(&mut self) {
-        let offer = {
-            let state = self.shared.read();
-            match &state.update {
-                // Yields the offer only from `Available`, so double clicks
-                // and stale intents are ignored.
-                UpdateStatus::Available(offer) => Some(offer.clone()),
-                _ => None,
-            }
-        };
+        let offer = self.shared.read().update.clone();
         let Some(offer) = offer else { return };
-        self.shared.update(|state| {
-            state.update = UpdateStatus::Downloading(offer.clone());
-        });
+        if self.update_busy {
+            return;
+        }
+        self.update_busy = true;
         // MSI installs download the installer; everything else opens the
         // release page right away, keeping the offer.
         let msi = matches!(update::install_mode(), update::InstallMode::Msi)
@@ -487,9 +477,7 @@ impl Worker {
     /// (portable builds, or a release without an installer asset). The
     /// offer stays: the button remains until a newer check replaces it.
     fn finish_update_page(&mut self, offer: &crate::update::Release) {
-        self.shared.update(|state| {
-            state.update = UpdateStatus::Available(offer.clone());
-        });
+        self.update_busy = false;
         if let Err(error) = open::that(&offer.page_url) {
             self.set_error(format!("couldn't open {}: {error}", offer.page_url));
         }
@@ -497,43 +485,24 @@ impl Worker {
 
     /// Applies a finished installer download: launches the updater and
     /// quits so no files are locked; the updater reopens the app once the
-    /// install finishes. Failures revert to the offer with an error, so
-    /// the button retries.
+    /// install finishes. Failures keep the offer with an error, so the
+    /// button retries.
     fn finish_update_download(&mut self, result: anyhow::Result<PathBuf>) {
-        let offer = {
-            let state = self.shared.read();
-            match &state.update {
-                UpdateStatus::Downloading(offer) => Some(offer.clone()),
-                _ => None,
-            }
-        };
-        let Some(offer) = offer else { return };
         match result {
-            Ok(path) => match launch_installer(&path) {
+            Ok(path) => match update::install_msi_and_relaunch(&path) {
                 Ok(()) => {
                     log::info!(target: "update", "updater launched, quitting for upgrade");
                     self.forward_tray(TrayAction::Quit);
                 }
                 Err(error) => {
-                    self.shared.update(|state| {
-                        state.update = UpdateStatus::Available(offer.clone());
-                    });
+                    self.update_busy = false;
                     self.set_error(format!("couldn't launch installer: {error}"));
                 }
             },
             Err(error) => {
-                self.shared.update(|state| {
-                    state.update = UpdateStatus::Available(offer.clone());
-                });
+                self.update_busy = false;
                 self.set_error(format!("update download failed: {error}"));
             }
         }
     }
-}
-
-/// Runs the downloaded package's installer, then reopens the app. Only
-/// MSI installs ever download, so this always runs `msiexec` through the
-/// detached waiter in `update`.
-fn launch_installer(path: &std::path::Path) -> anyhow::Result<()> {
-    update::install_msi_and_relaunch(path)
 }

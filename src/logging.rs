@@ -210,14 +210,22 @@ pub fn timestamp() -> String {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let (year, month, day) = civil_from_days((elapsed.as_secs() / 86_400) as i64);
-    let rem = elapsed.as_secs() % 86_400;
+    format_iso_ms(
+        (elapsed.as_secs() as i64) * 1000 + i64::from(elapsed.subsec_millis()),
+    )
+}
+
+/// Millis-since-epoch to `YYYY-MM-DDTHH:MM:SS.mmmZ` without a date crate.
+pub fn format_iso_ms(millis: i64) -> String {
+    let secs = millis.div_euclid(1000);
+    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
+    let time = secs.rem_euclid(86_400);
     format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60,
-        elapsed.subsec_millis()
+        time / 3600,
+        time % 3600 / 60,
+        time % 60,
+        millis.rem_euclid(1000),
     )
 }
 

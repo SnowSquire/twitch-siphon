@@ -42,50 +42,6 @@ pub enum UiIntent {
     ClearError,
 }
 
-/// Update offer shown in the top bar. The GUI renders it and sends
-/// [`UiIntent::ApplyUpdate`]; the work thread downloads and hands off to
-/// the installer. A click never fires from a toast.
-#[derive(Clone, Debug, Default)]
-pub enum UpdateStatus {
-    #[default]
-    Idle,
-    Checking,
-    Current,
-    Available(crate::update::Release),
-    Downloading(crate::update::Release),
-}
-
-/// Subscription state for one topic. Shared vocabulary: the work thread
-/// sets it, the GUI badges it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SubscriptionState {
-    Pending,
-    Connected,
-    Failed,
-}
-
-/// One channel's live row: the last resolved detail plus both
-/// subscription states. Lives only in [`Snapshot::channels`], keyed by
-/// channel id; the work thread mutates rows in place and the GUI reads
-/// them by id. Mute stamps and subscription protocol ids stay on the
-/// [`Worker`]: they are never rendered.
-#[derive(Clone)]
-pub struct ChannelRow {
-    pub channel: http::ChannelDetail,
-    pub title: SubscriptionState,
-    pub live: SubscriptionState,
-}
-
-impl ChannelRow {
-    pub(crate) fn new(channel: http::ChannelDetail) -> Self {
-        Self {
-            channel,
-            title: SubscriptionState::Pending,
-            live: SubscriptionState::Pending,
-        }
-    }
-}
-
 /// Everything the GUI needs for one frame. Single source of truth for
 /// presentation state: live rows live only here, mutated in place by
 /// the work thread under short write locks (never held across an
@@ -96,10 +52,10 @@ pub struct Snapshot {
     pub config: Config,
     pub connected: bool,
     pub conn_error: Option<String>,
-    pub channels: HashMap<u64, ChannelRow>,
+    pub channels: HashMap<u64, http::ChannelDetail>,
     pub pending: Vec<String>,
     pub error: String,
-    pub update: UpdateStatus,
+    pub update: Option<crate::update::Release>,
 }
 
 impl Default for Snapshot {
@@ -113,7 +69,7 @@ impl Default for Snapshot {
             channels: HashMap::with_capacity(32),
             pending: Vec::new(),
             error: String::new(),
-            update: UpdateStatus::Idle,
+            update: None,
         }
     }
 }
@@ -216,7 +172,8 @@ impl SharedSnapshot {
 }
 
 /// One finished background job: a channel resolve, a persisted save, a
-/// queued toast, a shown toast, an update step, or a connection attempt.
+/// queued toast, a shown toast, an update step, a subscription confirmation
+/// deadline, or a connection attempt.
 /// All kinds share the queue; completions dispatch in `handle_job`, which
 /// applies them to the [`Worker`] with plain `&mut` access.
 pub(crate) enum JobDone {
@@ -227,6 +184,7 @@ pub(crate) enum JobDone {
     UpdateCheckFinished(anyhow::Result<crate::update::Release>),
     UpdateCheckDue,
     UpdateDownloadFinished(anyhow::Result<PathBuf>),
+    SubscribeCheckDue(Topic, NanoId, u64),
     ConnectFinished(Box<ConnectOutcome>),
 }
 
@@ -253,21 +211,46 @@ pub struct WorkerInit {
     pub tray_rx: kanal::Receiver<TrayAction>,
     pub shared: SharedSnapshot,
 }
+/// One Hermes pubsub registration: the server-issued id plus whether the
+/// server confirmed it. Entries persist across reconnects; every welcome
+/// replays the whole map, which resets confirmations until that
+/// connection's answers arrive. Timeouts and rejections surface through
+/// the snapshot error; entries are never dropped, so retries ride the
+/// normal reconnect replay.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubState {
+    Pending,
+    Accepted,
+    Rejected,
+}
+
+/// One Hermes pubsub registration: the server-issued id, which send
+/// attempt it belongs to, and whether the server confirmed it. Attempt 0
+/// means never sent, which no timeout can match.
+#[derive(Clone, Copy)]
+pub(crate) struct SubEntry {
+    pub sub_id: NanoId,
+    pub attempt: u64,
+    pub state: SubState,
+}
+
 /// All mutable work-thread state, owned by the single work thread. The
 /// `shared` slot is the presentation source of truth (the GUI holds a
-/// clone of its `Arc`): live rows and subscription states live only
-/// there, mutated in place. Every other field is private to this thread
-/// and never rendered: mute stamps, subscription protocol ids,
-/// connection, background jobs. `handle_job`/`handle_intent` mutate with
-/// plain `&mut self`: jobs carry owned results back instead of sharing
-/// borrows, and locks are never held across an `await`.
+/// clone of its `Arc`): live rows live only there, mutated in place.
+/// Every other field is private to this thread and never rendered: mute
+/// stamps, subscription protocol ids, connection, background jobs.
+/// `handle_job`/`handle_intent` mutate with plain `&mut self`: jobs carry
+/// owned results back instead of sharing borrows, and locks are never
+/// held across an `await`.
 pub struct Worker {
     pub(crate) config_path: PathBuf,
     pub(crate) shared: SharedSnapshot,
     pub(crate) ui_rx: kanal::AsyncReceiver<UiIntent>,
     pub(crate) tray_rx: kanal::AsyncReceiver<TrayAction>,
     pub(crate) quiet_until: HashMap<u64, Instant>,
-    pub(crate) sub_ids: HashMap<Topic, NanoId>,
+    pub(crate) sub_ids: HashMap<Topic, SubEntry>,
+    pub(crate) sub_gen: u64,
+    pub(crate) update_busy: bool,
     pub(crate) matcher: Matcher,
     pub(crate) socket: Option<WsStream>,
     pub(crate) welcomed: bool,
@@ -292,6 +275,8 @@ impl Worker {
             tray_rx: params.tray_rx.to_async(),
             quiet_until: HashMap::new(),
             sub_ids: HashMap::new(),
+            sub_gen: 0,
+            update_busy: false,
             matcher,
             socket: None,
             welcomed: false,
@@ -501,14 +486,14 @@ mod tests {
                 assert!(state.pending.is_empty());
                 assert_eq!(state.config.channels.len(), 1);
                 // The row must publish from the tracked user, or the GUI
-                // keeps the Pending fallback despite an accepted subscribe.
+                // shows nothing for it until a reconnect re-baselines.
                 let row = state
                     .channels
                     .get(&7)
                     .expect("resolved channel should publish a row");
-                assert_eq!(row.channel.stream_id, 9);
-                assert_eq!(row.channel.viewers, Some(145));
-                assert_eq!(row.channel.collaboration_viewers, Some(889));
+                assert_eq!(row.stream_id, 9);
+                assert_eq!(row.viewers, Some(145));
+                assert_eq!(row.collaboration_viewers, Some(889));
             }
             assert!(worker.shared.read().channels.contains_key(&7));
             drive_one(&mut worker).await;

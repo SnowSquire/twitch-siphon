@@ -47,9 +47,7 @@ impl fmt::Display for NanoId {
 
 impl serde::Serialize for NanoId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let bytes = self.encode();
-        let text = core::str::from_utf8(&bytes).unwrap_or_default();
-        serializer.serialize_str(text)
+        serializer.collect_str(self)
     }
 }
 

@@ -11,7 +11,19 @@
 
 - Entry: `src/main.rs`. GUI thread (`src/app.rs` `SiphonView`, wgpui) is purely presentational: renders its own `Snapshot` copy, sends `UiIntent`s. All work-thread behavior lives in one `Worker` (`src/state.rs`, split across `src/event_loop.rs` for intents/jobs and `src/hermes.rs` for the connection) running on a compio thread-per-core runtime with a single `Worker::run()` loop; background work waits in one `FuturesUnordered` polled by that loop.
 - Cross-thread wire is only `kanal` channels plus one shared slot: `UiIntent` GUI→work, `Snapshot` work→GUI through the `SharedSnapshot` slot (an `Arc<RwLock<…>>` holding only what the GUI renders; each `update` wakes the pump through the bundled channel, carrying `GuiEvent` `Snapshot`/`Theme`/`Tray`), `TrayAction` tray→work via a `kanal` channel whose sender the `Tray` owns (`Tray::build(tx)`).
-- One source of truth for presentation state: live channel rows and subscription states live only in the shared `Snapshot`, mutated in place per event, never rebuilt. The worker holds no duplicate view-model — only what the GUI never renders (mute stamps, subscription protocol ids, socket, jobs). The GUI owns its snapshot copy and renders lock-free.
+- One source of truth for presentation state: live channel rows live only
+  in the shared `Snapshot`, mutated in place per event, never rebuilt. The
+  worker holds no duplicate view-model — only what the GUI never renders
+  (mute stamps, subscription protocol ids, socket, jobs). The GUI owns its
+  snapshot copy and renders lock-free.
+- Subscription acceptance is worker-private, not snapshot state: `sub_ids`
+  maps each `Topic` to a `SubEntry` (`sub_id`, send-attempt counter,
+  `Pending`/`Accepted`/`Rejected`). Every send arms one jobs-timeout
+  carrying (topic, sub-id, attempt); the timeout errors only on an exact
+  match still `Pending`, so stale deadlines can't fail newer attempts.
+  Rejections error immediately and never double-report. Entries are never
+  dropped — retries ride the normal reconnect replay. Notifications
+  require `Accepted`.
 - compio is thread-per-core, so futures are intentionally `!Send` (`future_not_send` allow in `Cargo.toml`; `compio::runtime::spawn` takes `Future + 'static` with no `Send` bound, so spawning is allowed but the single loop keeps all completions in one place). Never hold a `RwLock` guard across an `.await`: mutate the slot under short `SharedSnapshot::update` sections, and persist via save jobs that own a cloned `Config`.
 - `Config::load` is sync and only for `main` before any runtime exists; on the work thread only use async `Config::save` (compio fs) so the runtime never blocks.
 - Tray (`src/tray.rs`): built on the GUI thread inside `Application::run` (required thread affinity); the returned `Tray` value must stay alive (dropping removes the icon); `None` means close-to-quit instead of close-to-tray.
@@ -30,6 +42,11 @@
 - No speculative generality: no traits, generics, callbacks, or builders
   for one call site. Expose the direct value (a guard, a struct, a channel
   end) instead of inventing an API around it.
+- Prefer slices over `Vec` (and `&str` over `String`) for read-only
+  parameters; unconditionally shared work goes straight-line before the
+  branch, not into a helper. Duplication that guards different moments in
+  time (early-out vs mid-flight race check) stays duplicated — a helper
+  would hide which moment it serves.
 - A few duplicated lines beat a premature shared helper; deduplicate only
   once the shared logic is real, stable, and named by what it does.
 
@@ -55,7 +72,9 @@ network, no services.
   (`msiexec` before exe) and path quoting; matcher case-fold +
   empty-matches-nothing; `should_log_stream` change-only rule; date-math
   edges; no-msi + non-semver release shapes; fetch plumbing compared
-  against `parse_release` output, never re-asserted field-by-field.
+  against `parse_release` output, never re-asserted field-by-field;
+  subscription-confirmation timeout (pending-errors, accepted-silences,
+  stale-attempt-silences, rejection-singles).
 - Do NOT add: tests whose failure breaks the app on sight on every run —
   bundled asset round-trips, mainline envelope happy-paths, strict-greater
   version checks on a six-line function (known cuts: `tray.rs` ico/png
@@ -108,3 +127,4 @@ Comments describe the code as it exists now. Never describe the change itself.
 - Logging: `RUST_LOG=info|debug`, targets `app single config gql hermes notifier tray update`. Release goes to stderr plus a capped rotating file (10 MB total, 5 files) under local app-data `com.iken.siphon/logs`; debug goes to stdout only and never touches disk.
 - Single instance key `com.iken.siphon` (`com.iken.siphon.debug` in debug builds, which get a separate config dir too): a second launch wakes the primary via callback and exits.
 - Clippy allows that look like mistakes are deliberate: `cast_*` for tray math, `missing_panics_doc`/`missing_errors_doc`/`too_many_lines`/`missing_const_for_fn`.
+- Hiding to tray trims the working set (measured <10 MB resident in tray); open-memory is driver-dominated (~150 MB), don't chase it from the worker.
