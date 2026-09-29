@@ -4,7 +4,7 @@ name = "siphon"
 version = "0.2.0"
 description = "A twtich notifier"
 authors = ["Ozeniken"]
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 edition = "2024"
 
 [dependencies]
@@ -88,7 +88,7 @@ description = "Twitch notifier: track streamers, get a toast the moment they go 
 homepage = "https://github.com/SnowSquire/twitch-siphon"
 publisher = "Ozeniken"
 category = "Utility"
-licenseFile = "LICENSE"
+licenseFile = "LICENSE-APACHE"
 icons = ["icons/icon.ico", "icons/icon.png"]
 
 # Per-user MSI: cargo-packager has no install-scope option, so the WiX
