@@ -1,7 +1,7 @@
 #:schema https://www.schemastore.org/cargo.json
 [package]
 name = "siphon"
-version = "0.2.0"
+version = "0.3.0"
 description = "A twtich notifier"
 authors = ["Ozeniken"]
 license = "MIT OR Apache-2.0"
