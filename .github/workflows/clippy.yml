@@ -11,17 +11,40 @@ concurrency:
 jobs:
   clippy:
     runs-on: ubuntu-latest
+    env:
+      # Only fetch the x86_64 CRT/SDK, not aarch64.
+      XWIN_ARCH: x86_64
     steps:
       - uses: actions/checkout@v7
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, llvm-tools
           targets: x86_64-pc-windows-msvc
+
+      # ring's build script compiles C/asm for the msvc target, so it needs
+      # a lib.exe-compatible archiver; the clang-cl backend (same one local
+      # builds use instead of MSVC) covers compiler, archiver, and linker.
+      - name: install LLVM
+        run: sudo apt-get update && sudo apt-get install -y clang lld llvm
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
+      - name: cache cargo-xwin
+        id: xwin-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/cargo-xwin
+          key: cargo-xwin-0.23.1-x86_64-unknown-linux-gnu
+
+      - name: install cargo-xwin
+        if: steps.xwin-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-xwin --locked --version 0.23.1
+
       - name: clippy (windows)
-        run: cargo clippy --all-targets --locked --target x86_64-pc-windows-msvc
+        # Cross-check for Windows on Linux with cargo-xwin (MSVC CRT and
+        # Windows SDK are auto-downloaded; this consents to the MS license
+        # at https://go.microsoft.com/fwlink/?LinkId=2086102).
+        run: cargo xwin clippy --all-targets --locked --target x86_64-pc-windows-msvc
