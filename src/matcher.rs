@@ -46,7 +46,6 @@ impl Matcher {
             stride_shift,
         };
 
-        // Build the trie over folded bytes.
         for pattern in patterns {
             let mut node = 0usize;
 
@@ -80,11 +79,9 @@ impl Matcher {
             return matcher;
         }
 
-        // Build failure links and complete the transition table.
         let mut failure = vec![0u32; matcher.output.len()];
         let mut queue = VecDeque::new();
 
-        // Depth-one nodes fail to the root.
         for symbol in 0..alphabet_size {
             let child = matcher.transitions[symbol];
 
@@ -112,7 +109,6 @@ impl Matcher {
 
                     queue.push_back(child as usize);
                 } else {
-                    // Complete the DFA transition table.
                     matcher.transitions[index] =
                         matcher.transitions[(fail_node << stride_shift) + symbol];
                 }

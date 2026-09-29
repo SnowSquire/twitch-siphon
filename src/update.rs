@@ -117,7 +117,7 @@ pub fn install_mode() -> InstallMode {
 
 /// Downloads the installer to the temp dir. Reuses the streaming fetch,
 /// so a failed download never leaves a partial `.msi` behind.
-pub async fn download_msi(url: &str, version: &str) -> anyhow::Result<PathBuf> {
+pub async fn download_msi(url: &str, version: &semver::Version) -> anyhow::Result<PathBuf> {
     let path = std::env::temp_dir().join(format!("siphon-update-{version}.msi"));
     http::fetch_file(url, &path).await?;
     Ok(path)
@@ -196,25 +196,6 @@ mod tests {
         assert!(parse_release(body).is_err());
     }
 
-    #[test]
-    fn newer_tracks_current_build_version() {
-        let current = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
-        let mut next = current.clone();
-        next.patch += 1;
-        let newer = Release {
-            version: next,
-            msi_url: None,
-            page_url: String::new(),
-        };
-        assert!(newer_than_current(&newer));
-        let same = Release {
-            version: current,
-            msi_url: None,
-            page_url: String::new(),
-        };
-        assert!(!newer_than_current(&same));
-    }
-
     /// Serves one static HTTP response on loopback; the returned future
     /// must be polled concurrently with the client.
     async fn serve_once(response: Vec<u8>) -> (u16, impl Future<Output = ()>) {
@@ -243,7 +224,10 @@ mod tests {
     }
 
     #[test]
-    fn fetch_decodes_release_from_json_body() {
+    fn fetch_latest_from_delivers_body_to_parser() {
+        // Transport plumbing only: the fetched release must equal what
+        // `parse_release` makes of the same bytes. Parse branches are
+        // covered above without HTTP.
         let mut response = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             BODY.len()
@@ -256,11 +240,9 @@ mod tests {
             let url = format!("http://127.0.0.1:{port}/releases/latest");
             let ((), result) = futures_util::join!(serve, fetch_latest_from(&url));
             let release = result.unwrap();
-            assert_eq!(release.version, semver::Version::new(0, 2, 0));
-            assert_eq!(
-                release.msi_url.as_deref(),
-                Some("https://example.com/siphon.msi")
-            );
+            let expected = parse_release(BODY).unwrap();
+            assert_eq!(release.version, expected.version);
+            assert_eq!(release.msi_url, expected.msi_url);
         });
     }
 

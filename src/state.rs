@@ -1,10 +1,10 @@
 //! GUI↔work wire protocol and work-thread state.
 //!
 //! The GUI thread is purely presentational: it renders the latest
-//! [`AppState`] and sends [`UiIntent`]s. The work thread owns a [`Worker`]:
-//! presentation state lives in [`SharedFrame`] (the one slot the GUI reads),
+//! [`Snapshot`] and sends [`UiIntent`]s. The work thread owns a [`Worker`]:
+//! presentation state lives in [`SharedSnapshot`] (the one slot the GUI reads),
 //! everything else (connection, subscriptions, background jobs) is private
-//! to the work thread. Each [`SharedFrame::update`] wakes the foreground
+//! to the work thread. Each [`SharedSnapshot::update`] wakes the foreground
 //! pump through the same channel, so state and wakeup never drift apart.
 
 use std::collections::HashMap;
@@ -19,16 +19,16 @@ use futures_util::stream::FuturesUnordered;
 use kanal::Sender;
 use wgpui_kit::component::theme::ThemeMode;
 
-use crate::balesh::{CheapRng, Topic};
+use crate::balesh::{CheapRng, NanoId};
 use crate::config::Config;
-use crate::hermes::{Sub, WsStream};
+use crate::hermes::{Topic, WsStream};
 use crate::http;
 use crate::matcher::Matcher;
 use crate::notifier;
 use crate::tray::TrayAction;
 
 /// One imperative UI mutation. Sent GUI→work; the work thread applies it,
-/// persists it as a background job, and publishes a fresh [`AppState`].
+/// persists it as a background job, and publishes the change.
 /// Adds carry only the login (the only thing the UI knows); removes carry
 /// the resolved id.
 pub enum UiIntent {
@@ -51,59 +51,71 @@ pub enum UpdateStatus {
     Idle,
     Checking,
     Current,
-    Available(AvailableUpdate),
-    Downloading(AvailableUpdate),
+    Available(crate::update::Release),
+    Downloading(crate::update::Release),
 }
 
-/// A newer release: display version plus where to get it. `msi_url` is
-/// `None` on portable builds or when the release carries no installer,
-/// in which case the button opens `page_url` instead.
-#[derive(Clone, Debug)]
-pub struct AvailableUpdate {
-    pub version: String,
-    pub msi_url: Option<String>,
-    pub page_url: String,
-}
-
-/// One channel's subscription state for the GUI row, plus the resolved
-/// detail the expanded row shows.
-#[derive(Clone)]
-pub struct ChannelStatus {
-    pub channel_id: u64,
-    pub login: String,
-    pub display_name: String,
-    pub title_status: SubStatus,
-    pub live_status: SubStatus,
-    pub stream_id: u64,
-    pub stream_title: Option<String>,
-    /// Milliseconds since the unix epoch; `None` when offline.
-    pub stream_start: Option<i64>,
-    pub viewers: Option<u32>,
-    pub collaboration_viewers: Option<u32>,
-    pub game: Option<String>,
-    pub game_id: Option<u64>,
-}
-
-#[derive(Clone, Copy)]
-pub enum SubStatus {
+/// Subscription state for one topic. Shared vocabulary: the work thread
+/// sets it, the GUI badges it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionState {
     Pending,
     Connected,
     Failed,
 }
 
-/// Everything the GUI needs for one frame. This is the single source of
-/// truth for presentation state: the work thread mutates it under short
-/// write locks (never held across an `await`) and the GUI clones it out
-/// when its seen version lags.
-#[derive(Clone, Default)]
-pub struct AppState {
+/// One channel's live row: the last resolved detail plus both
+/// subscription states. Lives only in [`Snapshot::channels`], keyed by
+/// channel id; the work thread mutates rows in place and the GUI reads
+/// them by id. Mute stamps and subscription protocol ids stay on the
+/// [`Worker`]: they are never rendered.
+#[derive(Clone)]
+pub struct ChannelRow {
+    pub channel: http::ChannelDetail,
+    pub title: SubscriptionState,
+    pub live: SubscriptionState,
+}
+
+impl ChannelRow {
+    pub(crate) fn new(channel: http::ChannelDetail) -> Self {
+        Self {
+            channel,
+            title: SubscriptionState::Pending,
+            live: SubscriptionState::Pending,
+        }
+    }
+}
+
+/// Everything the GUI needs for one frame. Single source of truth for
+/// presentation state: live rows live only here, mutated in place by
+/// the work thread under short write locks (never held across an
+/// `await`); the GUI clones the snapshot out when its seen version
+/// lags.
+#[derive(Clone)]
+pub struct Snapshot {
     pub config: Config,
     pub connected: bool,
     pub conn_error: Option<String>,
-    pub channels: Vec<ChannelStatus>,
+    pub channels: HashMap<u64, ChannelRow>,
     pub pending: Vec<String>,
     pub error: String,
     pub update: UpdateStatus,
+}
+
+impl Default for Snapshot {
+    /// Capacities are reserved once so steady-state updates reuse the
+    /// allocations instead of regrowing the map per change.
+    fn default() -> Self {
+        Self {
+            config: Config::default(),
+            connected: false,
+            conn_error: None,
+            channels: HashMap::with_capacity(32),
+            pending: Vec::new(),
+            error: String::new(),
+            update: UpdateStatus::Idle,
+        }
+    }
 }
 
 /// Latest-only work→GUI snapshot slot. The work thread mutates it in place
@@ -115,16 +127,16 @@ pub struct AppState {
 /// traffic is user actions and connection events, never a hot loop, so no
 /// backlog builds in practice.
 #[derive(Clone)]
-pub struct SharedFrame {
-    inner: Arc<RwLock<AppState>>,
+pub struct SharedSnapshot {
+    inner: Arc<RwLock<Snapshot>>,
     version: Arc<AtomicU64>,
     tx: Sender<GuiEvent>,
 }
 
-impl SharedFrame {
+impl SharedSnapshot {
     /// Creates the slot plus the pump wakeups: the receiver belongs to the
     /// foreground pump awaiting [`GuiEvent`]s.
-    pub fn pair(state: AppState) -> (Self, kanal::AsyncReceiver<GuiEvent>) {
+    pub fn pair(state: Snapshot) -> (Self, kanal::AsyncReceiver<GuiEvent>) {
         let (tx, rx) = kanal::unbounded();
         (
             Self {
@@ -141,29 +153,32 @@ impl SharedFrame {
     /// `await`. A poisoned lock still applies the write; the snapshot
     /// matters more than the panic that poisoned it. Wakeups are
     /// idempotent: the pump skips the clone when its seen version is
-    /// current, so duplicates are harmless.
-    pub fn update(&self, apply: impl FnOnce(&mut AppState)) {
-        apply(
+    /// current, so duplicates are harmless. Returns whatever the
+    /// mutation computes, so callers can extract owned data in the same
+    /// pass instead of locking twice.
+    pub fn update<R>(&self, apply: impl FnOnce(&mut Snapshot) -> R) -> R {
+        let result = apply(
             &mut self
                 .inner
                 .write()
                 .unwrap_or_else(|poison| poison.into_inner()),
         );
         self.version.fetch_add(1, Ordering::Release);
-        self.send(GuiEvent::Frame);
+        self.send(GuiEvent::Snapshot);
+        result
     }
 
     /// Borrows the slot. Short critical sections only: never hold the
     /// guard across an `await` (clippy's `await_holding_lock` enforces
     /// this). A poisoned lock still reads; the snapshot matters more than
     /// the panic that poisoned it.
-    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, AppState> {
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Snapshot> {
         self.inner
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    /// Current version, bumped by every [`SharedFrame::update`]. The pump
+    /// Current version, bumped by every [`SharedSnapshot::update`]. The pump
     /// skips the clone when its seen version is current; a store racing
     /// the check surfaces on the next pass via the accompanying poke.
     pub fn version(&self) -> u64 {
@@ -171,18 +186,18 @@ impl SharedFrame {
     }
 }
 
-/// Work→GUI events sharing the [`SharedFrame`] channel to the foreground
-/// pump. `Frame` means the snapshot slot holds something newer; `Theme`
+/// Work→GUI events sharing the [`SharedSnapshot`] channel to the foreground
+/// pump. `Snapshot` means the slot holds something newer; `Theme`
 /// carries the mode the system watcher reported; `Tray` carries a tray or
-/// single-instance action. Tray handling reloads the frame too.
+/// single-instance action. Tray handling reloads the snapshot too.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GuiEvent {
-    Frame,
+    Snapshot,
     Theme(ThemeMode),
     Tray(TrayAction),
 }
 
-impl SharedFrame {
+impl SharedSnapshot {
     fn send(&self, event: GuiEvent) {
         if self.tx.send(event).is_err() {
             log::info!(target: "app", "gui channel closed");
@@ -205,8 +220,8 @@ impl SharedFrame {
 /// All kinds share the queue; completions dispatch in `handle_job`, which
 /// applies them to the [`Worker`] with plain `&mut` access.
 pub(crate) enum JobDone {
-    AddResolved(String, anyhow::Result<Option<http::ResolvedChannel>>),
-    LiveRefreshed(u64, anyhow::Result<Vec<http::ResolvedChannel>>),
+    AddResolved(String, anyhow::Result<Option<http::ChannelDetail>>),
+    LiveRefreshed(u64, anyhow::Result<Vec<http::ChannelDetail>>),
     SaveFinished(anyhow::Result<()>),
     ToastShown,
     UpdateCheckFinished(anyhow::Result<crate::update::Release>),
@@ -218,12 +233,10 @@ pub(crate) enum JobDone {
 /// Outcome of one connection attempt: the fresh baseline (with the ids
 /// that no longer resolve) plus the live socket, if the handshake
 /// succeeded. Failures reconnect with whatever the sync established.
-pub(crate) enum ConnectOutcome {
-    Connected {
-        channels: Vec<http::ResolvedChannel>,
-        missing: Vec<u64>,
-        socket: Option<WsStream>,
-    },
+pub(crate) struct ConnectOutcome {
+    pub channels: Vec<http::ChannelDetail>,
+    pub missing: Vec<u64>,
+    pub socket: Option<WsStream>,
 }
 
 /// One in-flight job. `!Send` is fine: everything stays on the single
@@ -233,26 +246,28 @@ pub(crate) type JobFuture = Pin<Box<dyn Future<Output = JobDone>>>;
 /// Everything the work thread needs at startup. Moved in whole; the
 /// channel ends are then owned by the run loop, the snapshot slot is
 /// shared with the GUI thread.
-pub struct WorkerParams {
+pub struct WorkerInit {
     pub config_path: PathBuf,
     pub config: Config,
     pub ui_rx: kanal::Receiver<UiIntent>,
     pub tray_rx: kanal::Receiver<TrayAction>,
-    pub shared: SharedFrame,
+    pub shared: SharedSnapshot,
 }
 /// All mutable work-thread state, owned by the single work thread. The
 /// `shared` slot is the presentation source of truth (the GUI holds a
-/// clone of its `Arc`); every other field is private to this thread.
-/// `handle_job`/`handle_intent` mutate with plain `&mut self`: jobs carry
-/// owned results back instead of sharing borrows, and locks are never
-/// held across an `await`.
+/// clone of its `Arc`): live rows and subscription states live only
+/// there, mutated in place. Every other field is private to this thread
+/// and never rendered: mute stamps, subscription protocol ids,
+/// connection, background jobs. `handle_job`/`handle_intent` mutate with
+/// plain `&mut self`: jobs carry owned results back instead of sharing
+/// borrows, and locks are never held across an `await`.
 pub struct Worker {
     pub(crate) config_path: PathBuf,
-    pub(crate) shared: SharedFrame,
+    pub(crate) shared: SharedSnapshot,
     pub(crate) ui_rx: kanal::AsyncReceiver<UiIntent>,
     pub(crate) tray_rx: kanal::AsyncReceiver<TrayAction>,
-    pub(crate) channels: HashMap<u64, (http::ResolvedChannel, Option<Instant>)>,
-    pub(crate) subs: HashMap<Topic, Sub>,
+    pub(crate) quiet_until: HashMap<u64, Instant>,
+    pub(crate) sub_ids: HashMap<Topic, NanoId>,
     pub(crate) matcher: Matcher,
     pub(crate) socket: Option<WsStream>,
     pub(crate) welcomed: bool,
@@ -266,7 +281,7 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn new(params: WorkerParams) -> Self {
+    pub fn new(params: WorkerInit) -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let matcher = crate::hermes::build_matcher(&params.config.filtered_words);
@@ -275,8 +290,8 @@ impl Worker {
             shared: params.shared,
             ui_rx: params.ui_rx.to_async(),
             tray_rx: params.tray_rx.to_async(),
-            channels: HashMap::new(),
-            subs: HashMap::new(),
+            quiet_until: HashMap::new(),
+            sub_ids: HashMap::new(),
             matcher,
             socket: None,
             welcomed: false,
@@ -304,39 +319,15 @@ impl Worker {
         });
     }
 
-    /// Rebuilds the channel rows from the tracked users and subscription
-    /// states, records connection health, and publishes. Called after
-    /// every change on either side; cheap enough to run unconditionally.
-    pub(crate) fn refresh_views(&self, conn_error: Option<String>) {
-        let mut channels: Vec<ChannelStatus> = self
-            .channels
-            .iter()
-            .map(|(id, (user, _))| ChannelStatus {
-                channel_id: *id,
-                login: user.channel_name.clone(),
-                display_name: user.channel_display_name.clone(),
-                title_status: self.status_for(crate::balesh::Topic::BroadcastSettingsUpdate(*id)),
-                live_status: self.status_for(crate::balesh::Topic::VideoPlaybackById(*id)),
-                stream_id: user.stream_id,
-                stream_title: user.stream_title.clone(),
-                stream_start: user.stream_start,
-                viewers: user.viewers,
-                collaboration_viewers: user.collaboration_viewers,
-                game: user
-                    .game
-                    .as_ref()
-                    .map(|game| game.display_name.clone())
-                    .filter(|name| !name.is_empty())
-                    .or_else(|| user.game.as_ref().map(|game| game.name.clone())),
-                game_id: user.game.as_ref().map(|game| game.id),
-            })
-            .collect();
-        channels.sort_by(|left, right| left.login.cmp(&right.login));
+    /// Records connection health after a lifecycle event: connected while
+    /// the socket is live and welcomed, plus any error to show. Data
+    /// mutations never call this: rows publish through their own updates,
+    /// so unrelated edits leave health alone.
+    pub(crate) fn publish_conn_health(&self, conn_error: Option<String>) {
         let connected = self.socket.is_some() && self.welcomed;
-        self.shared.update(|state| {
-            state.channels = channels;
-            state.connected = connected;
-            state.conn_error = conn_error;
+        self.shared.update(|snapshot| {
+            snapshot.connected = connected;
+            snapshot.conn_error = conn_error;
         });
     }
 
@@ -361,7 +352,9 @@ impl Worker {
             JobDone::ToastShown
         }));
     }
-    // OZEN: why does this exist, I believe it's because we inject our own 'tray' events, but in that case they shouldn't be called tray events and instead something else
+    // Tray and single-instance actions arrive on the work thread but take
+    // effect on the GUI thread; forwarding through the shared slot's channel
+    // lets the foreground pump apply them in one place.
     pub(crate) fn forward_tray(&self, action: TrayAction) {
         self.shared.notify_tray(action);
     }
@@ -378,8 +371,8 @@ mod tests {
             std::env::temp_dir().join(format!("siphon-worker-{name}-{}.json", std::process::id()));
         let (_ui_tx, ui_rx) = kanal::unbounded();
         let (_tray_tx, tray_rx) = kanal::unbounded();
-        let (shared, _gui_rx) = SharedFrame::pair(AppState::default());
-        let worker = Worker::new(WorkerParams {
+        let (shared, _gui_rx) = SharedSnapshot::pair(Snapshot::default());
+        let worker = Worker::new(WorkerInit {
             config_path: path.clone(),
             config,
             ui_rx,
@@ -478,10 +471,10 @@ mod tests {
     #[test]
     fn complete_add_login_persists_resolved_channel() {
         let (mut worker, path) = test_worker(Config::default(), "add");
-        let user = http::ResolvedChannel {
-            channel_id: 7,
-            channel_name: "alice".to_owned(),
-            channel_display_name: "Alice".to_owned(),
+        let user = http::ChannelDetail {
+            id: 7,
+            login: "alice".to_owned(),
+            display_name: "Alice".to_owned(),
             profile_image_url: String::new(),
             stream_id: 9,
             stream_title: None,
@@ -511,14 +504,13 @@ mod tests {
                 // keeps the Pending fallback despite an accepted subscribe.
                 let row = state
                     .channels
-                    .iter()
-                    .find(|c| c.channel_id == 7)
+                    .get(&7)
                     .expect("resolved channel should publish a row");
-                assert_eq!(row.stream_id, 9);
-                assert_eq!(row.viewers, Some(145));
-                assert_eq!(row.collaboration_viewers, Some(889));
+                assert_eq!(row.channel.stream_id, 9);
+                assert_eq!(row.channel.viewers, Some(145));
+                assert_eq!(row.channel.collaboration_viewers, Some(889));
             }
-            assert!(worker.channels.contains_key(&7));
+            assert!(worker.shared.read().channels.contains_key(&7));
             drive_one(&mut worker).await;
 
             let saved = saved_config(&path).await;
@@ -530,46 +522,46 @@ mod tests {
     }
 
     #[test]
-    fn complete_add_login_surfaces_typo_without_touching_disk() {
-        let (mut worker, path) = test_worker(Config::default(), "typo");
+    fn complete_add_login_failure_leaves_disk_untouched() {
+        // Both failure kinds — unknown login (`Ok(None)`) and transport
+        // error (`Err`) — must surface an error without touching disk or
+        // queueing a save.
+        for (name, login, transport_error) in
+            [("typo", "typo", false), ("resolve-err", "alice", true)]
+        {
+            let (mut worker, path) = test_worker(Config::default(), name);
 
-        block_on(async {
-            compio::fs::remove_file(&path).await.ok();
-            worker.request_add_login("typo".to_owned());
-            worker.jobs.clear();
-            worker.complete_add_login("typo".to_owned(), Ok(None)).await;
+            block_on(async {
+                compio::fs::remove_file(&path).await.ok();
+                worker.request_add_login(login.to_owned());
+                worker.jobs.clear();
+                let result: anyhow::Result<Option<http::ChannelDetail>> =
+                    if transport_error {
+                        Err(anyhow::anyhow!("boom"))
+                    } else {
+                        Ok(None)
+                    };
+                worker
+                    .complete_add_login(login.to_owned(), result)
+                    .await;
 
-            assert!(
-                compio::fs::metadata(&path).await.is_err(),
-                "typos must not create a config file"
-            );
-            assert!(worker.jobs.is_empty());
-            let state = worker.shared.read();
-            assert!(state.pending.is_empty());
-            assert!(!state.error.is_empty());
-        });
-    }
-
-    #[test]
-    fn complete_add_login_surfaces_transport_error_without_touching_disk() {
-        let (mut worker, path) = test_worker(Config::default(), "resolve-err");
-
-        block_on(async {
-            compio::fs::remove_file(&path).await.ok();
-            worker.request_add_login("alice".to_owned());
-            worker.jobs.clear();
-            worker
-                .complete_add_login("alice".to_owned(), Err(anyhow::anyhow!("boom")))
-                .await;
-
-            assert!(
-                compio::fs::metadata(&path).await.is_err(),
-                "failures must not create a config file"
-            );
-            assert!(worker.jobs.is_empty());
-            let state = worker.shared.read();
-            assert!(state.error.contains("failed to resolve alice"));
-        });
+                assert!(
+                    compio::fs::metadata(&path).await.is_err(),
+                    "{name}: failures must not create a config file"
+                );
+                assert!(worker.jobs.is_empty(), "{name}");
+                let state = worker.shared.read();
+                assert!(state.pending.is_empty(), "{name}");
+                assert!(!state.error.is_empty(), "{name}");
+                if transport_error {
+                    assert!(
+                        state.error.contains("failed to resolve alice"),
+                        "{name}: was {}",
+                        state.error
+                    );
+                }
+            });
+        }
     }
 
     #[test]

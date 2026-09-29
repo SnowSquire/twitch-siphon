@@ -75,27 +75,3 @@ impl CheapRng {
         z ^ (z >> 31)
     }
 }
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Topic {
-    BroadcastSettingsUpdate(u64),
-    VideoPlaybackById(u64),
-}
-
-impl Topic {
-    pub const fn for_channel(id: u64) -> [Self; 2] {
-        [
-            Self::BroadcastSettingsUpdate(id),
-            Self::VideoPlaybackById(id),
-        ]
-    }
-}
-
-impl fmt::Display for Topic {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::BroadcastSettingsUpdate(id) => write!(f, "broadcast-settings-update.{id}"),
-            Self::VideoPlaybackById(id) => write!(f, "video-playback-by-id.{id}"),
-        }
-    }
-}

@@ -1,4 +1,3 @@
-// No console window in release on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
@@ -15,9 +14,9 @@ mod tray;
 mod update;
 use wgpui::{App, Application, Bounds, QuitMode, WindowBounds, WindowOptions, px, size};
 
-use crate::app::{SiphonView, WindowParams};
+use crate::app::{SiphonView, ViewParams};
 use crate::config::Config;
-use crate::state::{AppState, SharedFrame, UiIntent, UpdateStatus, Worker, WorkerParams};
+use crate::state::{SharedSnapshot, Snapshot, UiIntent, Worker, WorkerInit};
 use crate::tray::TrayAction;
 
 /// Single-instance key and config directory name. Debug builds use a
@@ -64,20 +63,16 @@ fn main() {
     let (tray_tx, tray_rx) = kanal::unbounded::<TrayAction>();
     // Latest-only snapshot slot shared by the work thread (writer) and the
     // GUI thread (reader); every store wakes the foreground pump.
-    let (frame, gui_rx) = SharedFrame::pair(AppState {
+    let (snapshot, gui_rx) = SharedSnapshot::pair(Snapshot {
         config: config.clone(),
-        connected: false,
-        conn_error: None,
-        channels: Vec::new(),
-        pending: Vec::new(),
-        error: String::new(),
-        update: UpdateStatus::Idle,
+        ..Snapshot::default()
     });
 
-    //worker thread, runs hermes and event loop
-    let work_frame = frame.clone();
-    let wake_frame = frame.clone();
-    let theme_frame = frame.clone();
+    // One handle per consumer moved into the thread below: worker,
+    // single-instance wake callback, theme watcher.
+    let work_frame = snapshot.clone();
+    let wake_frame = snapshot.clone();
+    let theme_frame = snapshot.clone();
     let _work_thread = std::thread::Builder::new()
         .name("worker thread".to_owned())
         .spawn(move || {
@@ -88,7 +83,7 @@ fn main() {
                 compio::runtime::Runtime::new()
                     .expect("compio runtime")
                     .block_on(async move {
-                        let mut worker = Worker::new(WorkerParams {
+                        let mut worker = Worker::new(WorkerInit {
                             config_path,
                             config,
                             ui_rx,
@@ -126,9 +121,9 @@ fn main() {
                 None
             }
         };
-        let params = WindowParams {
+        let params = ViewParams {
             ui_tx,
-            shared: frame,
+            shared: snapshot,
             gui_rx,
             tray,
             single,

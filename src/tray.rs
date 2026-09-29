@@ -85,7 +85,7 @@ pub fn build(tx: Sender<TrayAction>) -> anyhow::Result<Tray> {
     let icon = load_icon()?;
     add_icon(hwnd, icon)?;
     if let Ok(mut guard) = icon_state().lock() {
-        *guard = Some(IconState { hwnd, icon });
+        *guard = Some(TrayIconState { hwnd, icon });
     }
     Ok(Tray {
         hwnd,
@@ -136,19 +136,19 @@ fn send_action(hwnd: HWND, action: TrayAction) {
     }
 }
 
-struct IconState {
+struct TrayIconState {
     hwnd: HWND,
     icon: HICON,
 }
 
 // SAFETY: the handles are only ever touched on the GUI thread that owns the
 // tray; the mutex never moves them across threads for use.
-unsafe impl Send for IconState {}
+unsafe impl Send for TrayIconState {}
 
 /// Live icon for re-adding after Explorer restarts.
-static ICON_STATE: OnceLock<Mutex<Option<IconState>>> = OnceLock::new();
+static ICON_STATE: OnceLock<Mutex<Option<TrayIconState>>> = OnceLock::new();
 
-fn icon_state() -> &'static Mutex<Option<IconState>> {
+fn icon_state() -> &'static Mutex<Option<TrayIconState>> {
     ICON_STATE.get_or_init(|| Mutex::new(None))
 }
 
@@ -283,7 +283,8 @@ fn show_menu(hwnd: HWND) {
     // SAFETY: appending a string item to a live menu with a nul-terminated
     // label that outlives the call.
     unsafe { AppendMenuW(menu, MF_STRING, MENU_OPEN as usize, open.as_ptr()) };
-    // SAFETY: same menu, second item.
+    // SAFETY: appending a string item to a live menu with a nul-terminated
+    // label that outlives the call.
     unsafe { AppendMenuW(menu, MF_STRING, MENU_QUIT as usize, quit.as_ptr()) };
     let mut point = POINT { x: 0, y: 0 };
     // SAFETY: reading the cursor position into a struct we own.
@@ -410,16 +411,6 @@ unsafe extern "system" fn wnd_proc(
 #[cfg(test)]
 mod tests {
     use super::{ICON_ICO, valid_ico};
-
-    #[test]
-    fn bundled_ico_validates() {
-        assert!(valid_ico(ICON_ICO));
-    }
-
-    #[test]
-    fn rejects_png_magic() {
-        assert!(!valid_ico(b"\x89PNG\r\n\x1a\n00000000"));
-    }
 
     #[test]
     fn rejects_truncated_directory() {

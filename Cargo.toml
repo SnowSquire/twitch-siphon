@@ -7,8 +7,6 @@ authors = ["Ozeniken"]
 license = "Apache-2.0"
 edition = "2024"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 # UI: wgpui (retained, wgpu + winit) with the Kit component façade for inputs
 # and buttons. Backend selection follows wgpui's wgpu (Vulkan); there is no
@@ -116,7 +114,8 @@ missing_const_for_fn = "allow"
 # and run on the single hermes runtime thread (or throwaway resolve threads).
 future_not_send = "allow"
 
-# Tray-specific overrides
+# `cast_*` for tray pixel math; `missing_panics_doc` for Win32 fns that only
+# fail on programmer error.
 cast_sign_loss = "allow"
 cast_lossless = "allow"
 cast_possible_truncation = "allow"

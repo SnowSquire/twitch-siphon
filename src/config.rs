@@ -86,11 +86,11 @@ impl Config {
 
 fn migrate_step(map: &mut Map<String, Value>, version: u64) -> anyhow::Result<()> {
     match version {
-        // v0 predates versioning but shares v1's shape: stamping (done by the
-        // caller) is the whole migration.
+        // Unversioned files share v1's shape: stamping (done by the caller)
+        // is the whole migration.
         0 => Ok(()),
-        // v1 predates word filtering: default it to on for "offline", unless
-        // the file already says otherwise.
+        // Files without word filtering default it to on for "offline",
+        // unless the file already says otherwise.
         1 => {
             map.entry("filteredWords")
                 .or_insert_with(|| Value::from(vec!["offline"]));

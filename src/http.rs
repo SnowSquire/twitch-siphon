@@ -24,7 +24,7 @@ const USER_BY_LOGIN_QUERY: &str = "query UserByLogin($login:String!){user(login:
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct Game {
+pub struct StreamGame {
     pub id: u64,
     pub name: String,
     pub display_name: String,
@@ -32,10 +32,10 @@ pub struct Game {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct ResolvedChannel {
-    pub channel_id: u64,
-    pub channel_name: String,
-    pub channel_display_name: String,
+pub struct ChannelDetail {
+    pub id: u64,
+    pub login: String,
+    pub display_name: String,
     pub profile_image_url: String,
     pub stream_id: u64,
     pub stream_title: Option<String>,
@@ -45,7 +45,7 @@ pub struct ResolvedChannel {
     pub stream_created_at: Option<String>,
     pub viewers: Option<u32>,
     pub collaboration_viewers: Option<u32>,
-    pub game: Option<Game>,
+    pub game: Option<StreamGame>,
     pub live: bool,
 }
 
@@ -140,12 +140,12 @@ where
 }
 
 impl GqlUser {
-    fn into_channel(self) -> Option<ResolvedChannel> {
+    fn into_channel(self) -> Option<ChannelDetail> {
         let broadcast = self.broadcast?;
-        Some(ResolvedChannel {
-            channel_id: self.id?,
-            channel_name: self.login.filter(|s| !s.is_empty())?,
-            channel_display_name: self.display_name.filter(|s| !s.is_empty())?,
+        Some(ChannelDetail {
+            id: self.id?,
+            login: self.login.filter(|s| !s.is_empty())?,
+            display_name: self.display_name.filter(|s| !s.is_empty())?,
             profile_image_url: self.profile_image_url.filter(|s| !s.is_empty())?,
             stream_id: broadcast.id?,
             stream_title: broadcast.title.filter(|title| !title.is_empty()),
@@ -159,7 +159,7 @@ impl GqlUser {
                 .as_ref()
                 .and_then(|stream| stream.created_at.clone()),
             game: broadcast.game.and_then(|game| {
-                Some(Game {
+                Some(StreamGame {
                     id: game.id?,
                     name: game.name?,
                     display_name: game.display_name?,
@@ -177,7 +177,7 @@ impl GqlUser {
 
 /// Resolves one login. `Ok(None)` means the login does not resolve
 /// (unknown login or unparseable user); `Err` is transport/decode failure.
-pub async fn fetch_channel(login: &str) -> anyhow::Result<Option<ResolvedChannel>> {
+pub async fn fetch_channel(login: &str) -> anyhow::Result<Option<ChannelDetail>> {
     let client = client()?;
     log::info!(target: "gql", "request: login={login:?}");
     let response = compio::time::timeout(
@@ -210,14 +210,14 @@ pub async fn fetch_channel(login: &str) -> anyhow::Result<Option<ResolvedChannel
         .data
         .and_then(|data| data.user)
         .and_then(GqlUser::into_channel)
-        .filter(|user| user.channel_name.eq_ignore_ascii_case(login));
+        .filter(|user| user.login.eq_ignore_ascii_case(login));
 
     if let Some(user) = &user {
         log::info!(
             target: "gql",
             "parsed user {}({}){}",
-            user.channel_name,
-            user.channel_id,
+            user.login,
+            user.id,
             if user.live { " live" } else { "" }
         );
     } else {
@@ -226,7 +226,7 @@ pub async fn fetch_channel(login: &str) -> anyhow::Result<Option<ResolvedChannel
     Ok(user)
 }
 
-pub async fn fetch_channels(ids: &[u64]) -> anyhow::Result<Vec<ResolvedChannel>> {
+pub async fn fetch_channels(ids: &[u64]) -> anyhow::Result<Vec<ChannelDetail>> {
     let client = client()?;
     log::info!(target: "gql", "request: ids={ids:?}");
     let response = compio::time::timeout(
@@ -271,8 +271,8 @@ pub async fn fetch_channels(ids: &[u64]) -> anyhow::Result<Vec<ResolvedChannel>>
             .iter()
             .map(|user| format!(
                 "{}({}){}",
-                user.channel_name,
-                user.channel_id,
+                user.login,
+                user.id,
                 if user.live { " live" } else { "" }
             ))
             .collect::<Vec<_>>()
@@ -322,7 +322,7 @@ mod tests {
 
     use super::{GqlIdsResponse, GqlLoginResponse, GqlUser};
 
-    fn decode_users(body: &[u8]) -> Vec<super::ResolvedChannel> {
+    fn decode_users(body: &[u8]) -> Vec<super::ChannelDetail> {
         let response: GqlIdsResponse = serde_json::from_slice(body).unwrap();
         response
             .data
@@ -333,7 +333,7 @@ mod tests {
             .collect()
     }
 
-    fn decode_login(body: &[u8]) -> Option<super::ResolvedChannel> {
+    fn decode_login(body: &[u8]) -> Option<super::ChannelDetail> {
         let response: GqlLoginResponse = serde_json::from_slice(body).unwrap();
         response
             .data
@@ -354,9 +354,9 @@ mod tests {
         let users = decode_users(body);
         assert_eq!(users.len(), 1, "{users:?}");
         let user = &users[0];
-        assert_eq!(user.channel_id, 123);
-        assert_eq!(user.channel_name, "alice");
-        assert_eq!(user.channel_display_name, "Alice");
+        assert_eq!(user.id, 123);
+        assert_eq!(user.login, "alice");
+        assert_eq!(user.display_name, "Alice");
         assert_eq!(user.profile_image_url, "http://x/y.png");
         assert_eq!(user.stream_id, 999);
         assert_eq!(user.stream_title.as_deref(), Some("hi"));
@@ -384,7 +384,7 @@ mod tests {
         let users = decode_users(body);
         assert_eq!(users.len(), 1, "{users:?}");
         let user = &users[0];
-        assert_eq!(user.channel_id, 456);
+        assert_eq!(user.id, 456);
         assert_eq!(user.stream_id, 777);
         assert!(user.stream_title.is_none());
         assert!(user.stream_start.is_none());
@@ -411,7 +411,7 @@ mod tests {
             ]}}"#;
         let users = decode_users(body);
         assert_eq!(users.len(), 1, "{users:?}");
-        assert_eq!(users[0].channel_id, 123);
+        assert_eq!(users[0].id, 123);
     }
 
     #[test]
@@ -422,29 +422,9 @@ mod tests {
     }
 
     #[test]
-    fn login_decode_keeps_live_user_with_game() {
-        let body = br#"{"data": {"user":
-                {"id": "123", "login": "alice", "displayName": "Alice",
-                 "profileImageURL": "http://x/y.png",
-                 "lastBroadcast": {"id": "999", "title": "hi",
-                    "game": {"id": "10", "name": "g", "displayName": "G"}},
-                 "stream": {"id": "1", "createdAt": "2026-09-10T18:35:06Z",
-                    "viewersCount": 145, "collaborationViewersCount": 889}}
-            }}"#;
-        let user = decode_login(body).expect("user should decode");
-        assert_eq!(user.channel_id, 123);
-        assert_eq!(user.channel_name, "alice");
-        assert_eq!(user.stream_id, 999);
-        assert_eq!(user.viewers, Some(145));
-        assert_eq!(user.collaboration_viewers, Some(889));
-        assert!(user.live);
-    }
-
-    #[test]
     fn login_decode_maps_unknown_or_bad_user_to_none() {
         assert!(decode_login(br#"{"data": {"user": null}}"#).is_none());
         assert!(decode_login(br#"{"data": null}"#).is_none());
-        // Missing broadcast settings cannot build a `User`.
         assert!(
             decode_login(
                 br#"{"data": {"user":

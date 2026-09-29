@@ -10,7 +10,7 @@ use futures_util::{FutureExt as _, StreamExt as _};
 
 use crate::config::Channel;
 use crate::http;
-use crate::state::{AvailableUpdate, JobDone, JobFuture, UiIntent, UpdateStatus, Worker};
+use crate::state::{JobDone, JobFuture, UiIntent, UpdateStatus, Worker};
 use crate::tray::TrayAction;
 use crate::update;
 
@@ -23,8 +23,8 @@ impl Worker {
             if self.socket.is_none()
                 && !self.connecting
                 && {
-                    let this = &self;
-                    !this.channels.is_empty() || !this.shared.read().config.channels.is_empty()
+                    let snapshot = self.shared.read();
+                    !snapshot.channels.is_empty() || !snapshot.config.channels.is_empty()
                 }
                 && Instant::now() >= self.reconnect_at
             {
@@ -138,11 +138,7 @@ impl Worker {
                         self.shared.update(|state| {
                             state.update = if update::newer_than_current(&release) {
                                 log::info!(target: "update", "new release: {}", release.version);
-                                UpdateStatus::Available(AvailableUpdate {
-                                    version: release.version.to_string(),
-                                    msi_url: release.msi_url,
-                                    page_url: release.page_url,
-                                })
+                                UpdateStatus::Available(release)
                             } else {
                                 UpdateStatus::Current
                             };
@@ -238,7 +234,7 @@ impl Worker {
     pub(crate) async fn complete_add_login(
         &mut self,
         login: String,
-        result: anyhow::Result<Option<http::ResolvedChannel>>,
+        result: anyhow::Result<Option<http::ChannelDetail>>,
     ) {
         let stale = {
             let state = self.shared.read();
@@ -256,8 +252,8 @@ impl Worker {
                     target: "config",
                     "resolved {} to id {} ({})",
                     login,
-                    user.channel_id,
-                    user.channel_display_name
+                    user.id,
+                    user.display_name
                 );
                 let duplicate = {
                     let state = self.shared.read();
@@ -265,13 +261,13 @@ impl Worker {
                         .config
                         .channels
                         .iter()
-                        .any(|existing| existing.id == user.channel_id)
+                        .any(|existing| existing.id == user.id)
                 };
-                let id = user.channel_id;
+                let id = user.id;
                 let channel = Channel {
-                    login: user.channel_name.clone(),
-                    id: user.channel_id,
-                    display_name: Some(user.channel_display_name.clone()),
+                    login: user.login.clone(),
+                    id: user.id,
+                    display_name: Some(user.display_name.clone()),
                 };
                 self.shared.update(|state| {
                     state
@@ -284,13 +280,12 @@ impl Worker {
                 if duplicate {
                     return;
                 }
-                // Track the resolved user so status rows and notifications
-                // see it, then publish: without this the row keeps the
-                // Pending fallback until a reconnect re-baselines.
+                // Track the resolved user so rows and notifications see
+                // it: without this the row keeps the Pending fallback
+                // until a reconnect re-baselines.
                 self.track_channel(user);
                 self.queue_save();
                 self.ensure_subs(id);
-                self.refresh_views(None);
                 if self.welcomed {
                     self.subscribe_channel(id).await;
                 }
@@ -335,7 +330,6 @@ impl Worker {
             }))
             .await;
         }
-        self.refresh_views(None);
         self.queue_save();
     }
 
@@ -364,14 +358,12 @@ impl Worker {
         for id in ids {
             self.drop_channel(*id);
         }
-        let conn_error = self.shared.read().conn_error.clone();
-        self.shared.update(|state| {
-            state
+        self.shared.update(|snapshot| {
+            snapshot
                 .config
                 .channels
                 .retain(|channel| !ids.contains(&channel.id));
         });
-        self.refresh_views(conn_error);
         self.queue_save();
         let names = pruned.join(", ");
         if pruned.len() == 1 {
@@ -494,7 +486,7 @@ impl Worker {
     /// Opens the release page for builds with no installer handoff
     /// (portable builds, or a release without an installer asset). The
     /// offer stays: the button remains until a newer check replaces it.
-    fn finish_update_page(&mut self, offer: &AvailableUpdate) {
+    fn finish_update_page(&mut self, offer: &crate::update::Release) {
         self.shared.update(|state| {
             state.update = UpdateStatus::Available(offer.clone());
         });

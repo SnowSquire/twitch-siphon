@@ -12,7 +12,7 @@ use wgpui_kit::component::scroll::ScrollableElement as _;
 use wgpui_kit::component::theme::{Theme, ThemeMode};
 use wgpui_kit::component::tooltip::Tooltip;
 
-use crate::state::{AppState, ChannelStatus, GuiEvent, SharedFrame, SubStatus, UiIntent, UpdateStatus};
+use crate::state::{ChannelRow, GuiEvent, SharedSnapshot, Snapshot, SubscriptionState, UiIntent, UpdateStatus};
 use crate::tray::{Tray, TrayAction};
 
 const GREEN: u32 = 0x2e_a043;
@@ -29,9 +29,9 @@ enum Tab {
 /// Everything the window builder needs beyond the wgpui contexts. Moved into
 /// the builder closure; the channel ends go to the pump task, the rest lives
 /// on the view entity.
-pub struct WindowParams {
+pub struct ViewParams {
     pub ui_tx: Sender<UiIntent>,
-    pub shared: SharedFrame,
+    pub shared: SharedSnapshot,
     pub gui_rx: kanal::AsyncReceiver<GuiEvent>,
     pub tray: Option<Tray>,
     pub single: app_single_instance::PrimaryHandle,
@@ -39,9 +39,9 @@ pub struct WindowParams {
 
 pub struct SiphonView {
     ui_tx: Sender<UiIntent>,
-    shared: SharedFrame,
-    seen_version: u64,
-    frame: AppState,
+    shared: SharedSnapshot,
+    snapshot_version: u64,
+    snapshot: Snapshot,
     login_input: Entity<InputState>,
     word_input: Entity<InputState>,
     tab: Tab,
@@ -65,18 +65,18 @@ pub struct SiphonView {
 impl SiphonView {
     /// Builds the view entity, wires input events and the work→GUI pump, and
     /// wraps it in the Kit root the window renders.
-    pub fn build(window: &mut Window, cx: &mut App, params: WindowParams) -> Entity<Root> {
+    pub fn build(window: &mut Window, cx: &mut App, params: ViewParams) -> Entity<Root> {
         let login_input = cx.new(|cx| InputState::new(window, cx).placeholder("Add new streamer"));
         let word_input = cx.new(|cx| InputState::new(window, cx).placeholder("Add filtered word"));
-        let frame = params.shared.read().clone();
-        let seen_version = params.shared.version();
+        let snapshot = params.shared.read().clone();
+        let snapshot_version = params.shared.version();
         let hwnd = win_hwnd(window);
         let window_icon = hwnd.and_then(set_window_icon);
         let view = cx.new(|_cx| SiphonView {
             ui_tx: params.ui_tx,
             shared: params.shared,
-            seen_version,
-            frame,
+            snapshot_version,
+            snapshot,
             login_input: login_input.clone(),
             word_input: word_input.clone(),
             tab: Tab::Channels,
@@ -88,7 +88,6 @@ impl SiphonView {
             _subs: Vec::new(),
         });
 
-        // Enter in either field submits it, the same as the Add button.
         for (input, intent) in [
             (login_input, UiIntent::AddLogin as fn(String) -> UiIntent),
             (
@@ -185,7 +184,7 @@ fn windows_registry_mode() -> Option<ThemeMode> {
 /// clipboard apartment. The callback reads the reported mode and forwards
 /// it through the frame channel; the pump applies it directly, so
 /// there is no new channel, no new task, and no polling.
-pub fn watch_system_theme(frame: SharedFrame) {
+pub fn watch_system_theme(frame: SharedSnapshot) {
     use windows::Foundation::TypedEventHandler;
     use windows::UI::ViewManagement::UISettings;
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
@@ -230,8 +229,8 @@ fn spawn_pump(cx: &mut App, view: &Entity<SiphonView>, gui_rx: kanal::AsyncRecei
     cx.spawn(async move |cx| {
         loop {
             match gui_rx.recv().await {
-                Ok(GuiEvent::Frame) => {
-                    if reload_frame(&weak, cx).is_err() {
+                Ok(GuiEvent::Snapshot) => {
+                    if reload_snapshot(&weak, cx).is_err() {
                         break;
                     }
                 }
@@ -241,7 +240,7 @@ fn spawn_pump(cx: &mut App, view: &Entity<SiphonView>, gui_rx: kanal::AsyncRecei
                     }
                 }
                 Ok(GuiEvent::Tray(action)) => {
-                    if reload_frame(&weak, cx).is_err() || handle_tray(cx, &weak, action).is_err() {
+                    if reload_snapshot(&weak, cx).is_err() || handle_tray(cx, &weak, action).is_err() {
                         break;
                     }
                 }
@@ -254,14 +253,14 @@ fn spawn_pump(cx: &mut App, view: &Entity<SiphonView>, gui_rx: kanal::AsyncRecei
 
 /// Copies a newer snapshot into the view.
 /// Reports whether the view is still alive.
-fn reload_frame(weak: &wgpui::WeakEntity<SiphonView>, cx: &mut AsyncApp) -> wgpui::Result<()> {
+fn reload_snapshot(weak: &wgpui::WeakEntity<SiphonView>, cx: &mut AsyncApp) -> wgpui::Result<()> {
     weak.update(cx, |view, cx| {
         let fresh = view.shared.version();
-        if fresh == view.seen_version {
+        if fresh == view.snapshot_version {
             return;
         }
-        view.frame = view.shared.read().clone();
-        view.seen_version = fresh;
+        view.snapshot = view.shared.read().clone();
+        view.snapshot_version = fresh;
         cx.notify();
     })
 }
@@ -363,7 +362,7 @@ fn header(view: &SiphonView, _cx: &mut Context<SiphonView>) -> impl IntoElement 
         .child(div().text_xl().child("Siphon"))
         .child(connection(view));
 
-    match &view.frame.update {
+    match &view.snapshot.update {
         UpdateStatus::Available(offer) => {
             let ui_tx = view.ui_tx.clone();
             row = row.child(
@@ -383,7 +382,7 @@ fn header(view: &SiphonView, _cx: &mut Context<SiphonView>) -> impl IntoElement 
 }
 
 fn connection(view: &SiphonView) -> impl IntoElement {
-    let (text, color) = connection_text(view.frame.connected, view.frame.conn_error.as_deref());
+    let (text, color) = connection_text(view.snapshot.connected, view.snapshot.conn_error.as_deref());
     div().text_color(rgb(color)).child(text.to_owned())
 }
 
@@ -412,7 +411,7 @@ fn tabs(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoElement {
 }
 
 fn channel_list(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoElement {
-    if view.frame.config.channels.is_empty() && view.frame.pending.is_empty() {
+    if view.snapshot.config.channels.is_empty() && view.snapshot.pending.is_empty() {
         return div().child("No channels configured. Add a streamer below.");
     }
     let mut list = div().flex().flex_col().gap_1();
@@ -426,18 +425,14 @@ fn channel_list(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoEle
             .child(div().w(px(110.)).child("Title Status"))
             .child(div().w(px(36.)).child("")),
     );
-    for channel in &view.frame.config.channels {
-        let resolved = view
-            .frame
-            .channels
-            .iter()
-            .find(|entry| entry.channel_id == channel.id);
+    for channel in &view.snapshot.config.channels {
+        let resolved = view.snapshot.channels.get(&channel.id);
         let name = resolved
-            .map(|entry| entry.display_name.as_str())
+            .map(|entry| entry.channel.display_name.as_str())
             .or(channel.display_name.as_deref())
             .unwrap_or(channel.login.as_str());
-        let (live, title) = resolved.map_or((SubStatus::Pending, SubStatus::Pending), |entry| {
-            (entry.live_status, entry.title_status)
+        let (live, title) = resolved.map_or((SubscriptionState::Pending, SubscriptionState::Pending), |entry| {
+            (entry.live, entry.title)
         });
         let id = channel.id;
         let login = channel.login.clone();
@@ -478,7 +473,7 @@ fn channel_list(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoEle
         }
         list = list.child(wrapper);
     }
-    for login in &view.frame.pending {
+    for login in &view.snapshot.pending {
         list = list.child(
             div()
                 .flex()
@@ -486,8 +481,8 @@ fn channel_list(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoEle
                 .gap_2()
                 .items_center()
                 .child(div().flex_1().child(login.clone()))
-                .child(div().w(px(110.)).child(sub_badge(SubStatus::Pending)))
-                .child(div().w(px(110.)).child(sub_badge(SubStatus::Pending)))
+                .child(div().w(px(110.)).child(sub_badge(SubscriptionState::Pending)))
+                .child(div().w(px(110.)).child(sub_badge(SubscriptionState::Pending)))
                 .child(div().w(px(36.)).child("…")),
         );
     }
@@ -499,16 +494,29 @@ fn channel_list(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoEle
 /// The muted background groups it with the row above. Hovering the login
 /// shows the channel id, hovering the title shows the stream id, hovering
 /// the game shows the game id.
-fn channel_detail(entry: &ChannelStatus, cx: &App) -> impl IntoElement {
-    let channel_tip = format!("id {}", entry.channel_id);
-    let stream_tip = if entry.stream_id == 0 {
+fn channel_detail(entry: &ChannelRow, cx: &App) -> impl IntoElement {
+    let channel = &entry.channel;
+    let channel_tip = format!("id {}", channel.id);
+    let stream_tip = if channel.stream_id == 0 {
         "no stream".to_owned()
     } else {
-        format!("stream {}", entry.stream_id)
+        format!("stream {}", channel.stream_id)
     };
-    let game_tip = entry
-        .game_id
-        .map_or("no game".to_owned(), |id| format!("game {id}"));
+    let game_tip = channel
+        .game
+        .as_ref()
+        .map_or("no game".to_owned(), |game| format!("game {}", game.id));
+    let game_label = channel
+        .game
+        .as_ref()
+        .map(|game| {
+            if game.display_name.is_empty() {
+                game.name.as_str()
+            } else {
+                game.display_name.as_str()
+            }
+        })
+        .unwrap_or("no game");
     div()
         .flex()
         .flex_col()
@@ -525,21 +533,21 @@ fn channel_detail(entry: &ChannelStatus, cx: &App) -> impl IntoElement {
                 .child(
                     div()
                         .flex_1()
-                        .id(format!("channel-login-{}", entry.channel_id))
+                        .id(format!("channel-login-{}", channel.id))
                         .tooltip(move |window, cx| {
                             Tooltip::new(channel_tip.clone()).build(window, cx)
                         })
-                        .child(entry.login.clone()),
+                        .child(channel.login.clone()),
                 )
                 .child(
                     div()
                         .flex_1()
-                        .id(format!("stream-title-{}", entry.channel_id))
+                        .id(format!("stream-title-{}", channel.id))
                         .tooltip(move |window, cx| {
                             Tooltip::new(stream_tip.clone()).build(window, cx)
                         })
                         .child(
-                            entry
+                            channel
                                 .stream_title
                                 .clone()
                                 .unwrap_or_else(|| "no title".to_owned()),
@@ -552,27 +560,27 @@ fn channel_detail(entry: &ChannelStatus, cx: &App) -> impl IntoElement {
                 .flex()
                 .flex_row()
                 .gap_2()
-                .child(div().flex_1().child(format_stream_start(entry.stream_start)))
+                .child(div().flex_1().child(format_stream_start(channel.stream_start)))
                 .child(
                     div()
                         .flex_1()
-                        .id(format!("game-{}", entry.channel_id))
+                        .id(format!("game-{}", channel.id))
                         .tooltip(move |window, cx| {
                             Tooltip::new(game_tip.clone()).build(window, cx)
                         })
-                        .child(
-                            entry.game.clone().unwrap_or_else(|| "no game".to_owned()),
-                        ),
+                        .child(game_label.to_owned()),
                 ),
         )
 }
 
 /// Viewers as `viewers/collaboration`, with dashes for unknowns.
-fn viewers_text(entry: &ChannelStatus) -> String {
+fn viewers_text(entry: &ChannelRow) -> String {
     let viewers = entry
+        .channel
         .viewers
         .map_or("—".to_owned(), |viewers| viewers.to_string());
     let collab = entry
+        .channel
         .collaboration_viewers
         .map_or("—".to_owned(), |collab| collab.to_string());
     format!("{viewers}/{collab}")
@@ -620,7 +628,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 }
 
 fn word_list(view: &SiphonView, _cx: &mut Context<SiphonView>) -> impl IntoElement {    let mut row = div().flex().flex_row().flex_wrap().gap_1();
-    for (index, word) in view.frame.config.filtered_words.iter().enumerate() {
+    for (index, word) in view.snapshot.config.filtered_words.iter().enumerate() {
         let ui_tx = view.ui_tx.clone();
         let label = format!("{word} ×");
         row = row.child(Button::new(format!("word-{index}")).label(label).on_click(
@@ -629,7 +637,7 @@ fn word_list(view: &SiphonView, _cx: &mut Context<SiphonView>) -> impl IntoEleme
             },
         ));
     }
-    if view.frame.config.filtered_words.is_empty() {
+    if view.snapshot.config.filtered_words.is_empty() {
         row = row.child("No filtered words. Add one below.");
     }
     row
@@ -667,7 +675,7 @@ fn toggles(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoElement 
         .child(toggle_row(
             "notify-titles",
             "Notify on title changes while offline",
-            view.frame.config.notify_title_changes,
+            view.snapshot.config.notify_title_changes,
             dark,
             view.ui_tx.clone(),
             UiIntent::SetNotifyTitleChanges,
@@ -675,7 +683,7 @@ fn toggles(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoElement 
         .child(toggle_row(
             "sound",
             "Notification sound",
-            view.frame.config.sound,
+            view.snapshot.config.sound,
             dark,
             view.ui_tx.clone(),
             UiIntent::SetSound,
@@ -750,7 +758,7 @@ fn toggle_row(
 }
 
 fn error_row(view: &SiphonView) -> impl IntoElement {
-    if view.frame.error.is_empty() {
+    if view.snapshot.error.is_empty() {
         return div();
     }
     let ui_tx = view.ui_tx.clone();
@@ -763,7 +771,7 @@ fn error_row(view: &SiphonView) -> impl IntoElement {
             div()
                 .flex_1()
                 .text_color(rgb(RED))
-                .child(view.frame.error.clone()),
+                .child(view.snapshot.error.clone()),
         )
         .child(Button::new("dismiss").label("×").on_click(move |_, _, _| {
             let _ = ui_tx.send(UiIntent::ClearError);
@@ -778,17 +786,17 @@ fn connection_text(connected: bool, error: Option<&str>) -> (&str, u32) {
     }
 }
 
-fn sub_badge(state: SubStatus) -> impl IntoElement {
+fn sub_badge(state: SubscriptionState) -> impl IntoElement {
     let (text, color) = match state {
-        SubStatus::Pending => ("Pending", GRAY),
-        SubStatus::Connected => ("Connected", GREEN),
-        SubStatus::Failed => ("Failed", RED),
+        SubscriptionState::Pending => ("Pending", GRAY),
+        SubscriptionState::Connected => ("Connected", GREEN),
+        SubscriptionState::Failed => ("Failed", RED),
     };
     div().text_color(rgb(color)).child(text)
 }
 
 /// Raw Win32 handle for our own window. wgpui exposes no hide API, so
-/// visibility goes through Win32, the same approach as the eframe app.
+/// visibility goes through Win32.
 fn win_hwnd(window: &Window) -> Option<isize> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
