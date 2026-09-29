@@ -11,13 +11,11 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use futures_util::stream::FuturesUnordered;
 use kanal::Sender;
-use wgpui_kit::component::theme::ThemeMode;
 
 use crate::balesh::{CheapRng, NanoId};
 use crate::config::Config;
@@ -26,6 +24,24 @@ use crate::http;
 use crate::matcher::Matcher;
 use crate::notifier;
 use crate::tray::TrayAction;
+
+/// System light/dark mode. The watcher reports it, the GUI applies it as a
+/// single `dark` flag; Slint picks colors off that flag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ThemeMode {
+    Light,
+    Dark,
+}
+
+impl ThemeMode {
+    pub fn is_dark(self) -> bool {
+        matches!(self, Self::Dark)
+    }
+
+    pub fn name(self) -> &'static str {
+        if self.is_dark() { "dark" } else { "light" }
+    }
+}
 
 /// One imperative UI mutation. Sent GUI→work.
 pub enum UiIntent {
@@ -73,38 +89,35 @@ impl Default for Snapshot {
 /// Latest-only work→GUI snapshot slot. The work thread mutates it in place
 /// on every change; each mutation wakes the foreground pump through the
 /// bundled channel, so state and wakeup never drift apart. The GUI thread
-/// clones the snapshot out when its seen version lags. Intermediate states
-/// vanish instead of queueing, so a stalled GUI never builds backlog.
+/// clones the snapshot out and applies it to the retained properties.
+/// Intermediate states vanish instead of queueing, so a stalled GUI never
+/// builds backlog.
 /// The channel is unbounded because tray actions are lossless; frame
 /// traffic is user actions and connection events, never a hot loop, so no
 /// backlog builds in practice.
 pub struct SharedSnapshot {
     inner: RwLock<Snapshot>,
-    version: AtomicU64,
     tx: Sender<GuiEvent>,
 }
 
 impl SharedSnapshot {
-    pub fn pair(state: Snapshot) -> (Arc<Self>, kanal::AsyncReceiver<GuiEvent>) {
+    pub fn pair(state: Snapshot) -> (Arc<Self>, kanal::Receiver<GuiEvent>) {
         let (tx, rx) = kanal::unbounded();
         (
             Arc::new(Self {
                 inner: RwLock::new(state),
-                version: AtomicU64::new(0),
                 tx,
             }),
-            rx.to_async(),
+            rx,
         )
     }
 
-    /// Mutates the slot in place, marks it newer, and wakes the pump.
-    /// Short critical sections only: never hold the guard across an
-    /// `await`. A poisoned lock still applies the write; the snapshot
-    /// matters more than the panic that poisoned it. Wakeups are
-    /// idempotent: the pump skips the clone when its seen version is
-    /// current, so duplicates are harmless. Returns whatever the
-    /// mutation computes, so callers can extract owned data in the same
-    /// pass instead of locking twice.
+    /// Mutates the slot in place and wakes the pump. Short critical
+    /// sections only: never hold the guard across an `await`. A poisoned
+    /// lock still applies the write; the snapshot matters more than the
+    /// panic that poisoned it. Returns whatever the mutation computes, so
+    /// callers can extract owned data in the same pass instead of locking
+    /// twice.
     pub fn update<R>(&self, apply: impl FnOnce(&mut Snapshot) -> R) -> R {
         let result = apply(
             &mut self
@@ -112,7 +125,6 @@ impl SharedSnapshot {
                 .write()
                 .unwrap_or_else(|poison| poison.into_inner()),
         );
-        self.version.fetch_add(1, Ordering::Release);
         self.send(GuiEvent::Snapshot);
         result
     }
@@ -121,10 +133,6 @@ impl SharedSnapshot {
         self.inner
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
-    }
-
-    pub fn version(&self) -> u64 {
-        self.version.load(Ordering::Acquire)
     }
 }
 

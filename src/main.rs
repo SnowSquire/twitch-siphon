@@ -11,10 +11,12 @@ mod matcher;
 mod notifier;
 mod state;
 mod tray;
+mod ui;
 mod update;
-use wgpui::{App, Application, Bounds, QuitMode, WindowBounds, WindowOptions, px, size};
 
-use crate::app::{SiphonView, ViewParams};
+use slint::ComponentHandle as _;
+
+use crate::app::{ViewParams, build};
 use crate::config::Config;
 use crate::state::{SharedSnapshot, Snapshot, UiIntent, Worker, WorkerInit};
 use crate::tray::TrayAction;
@@ -107,41 +109,22 @@ fn main() {
         wake_frame.notify_tray(TrayAction::Show);
     });
 
-    Application::new().run(move |cx: &mut App| {
-        wgpui_kit::init(cx);
-        // The app lives in the tray with its window hidden; closing the
-        // last window must never end the event loop on its own.
-        cx.set_quit_mode(QuitMode::Explicit);
-        // Built here so every platform constructs it on the event-loop
-        // thread; the view owns it afterwards, and dropping removes it.
-        let tray = match tray::build(tray_tx) {
-            Ok(tray) => Some(tray),
-            Err(error) => {
-                log::error!(target: "tray", "tray build failed: {error}");
-                None
-            }
-        };
-        let params = ViewParams {
-            ui_tx,
-            shared: snapshot,
-            gui_rx,
-            tray,
-            single,
-        };
-        let bounds = Bounds::centered(None, size(px(420.), px(520.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(420.), px(520.))),
-                app_id: Some(APP_ID.to_owned()),
-                ..Default::default()
-            },
-            move |window: &mut wgpui::Window, cx: &mut App| {
-                window.set_window_title("Siphon");
-                SiphonView::build(window, cx, params)
-            },
-        )
-        .expect("siphon window");
-        cx.activate(true);
+    // Built here so the tray message window lives on the event-loop thread;
+    // the guards own it afterwards, and dropping removes the icon.
+    let tray = match tray::build(tray_tx) {
+        Ok(tray) => Some(tray),
+        Err(error) => {
+            log::error!(target: "tray", "tray build failed: {error}");
+            None
+        }
+    };
+    let (ui, guards) = build(ViewParams {
+        ui_tx,
+        shared: snapshot,
+        gui_rx,
+        tray,
+        single,
     });
+    ui.run().expect("slint event loop");
+    drop(guards);
 }

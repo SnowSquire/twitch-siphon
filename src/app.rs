@@ -1,190 +1,76 @@
+//! Slint foreground: builds the retained `AppWindow`, maps the worker
+//! `Snapshot` onto its properties, and forwards callbacks as `UiIntent`s.
+//!
+//! The view owns no state of its own: every pump event clones the latest
+//! snapshot out of the shared slot under a short lock and applies it on the
+//! UI thread through the weak handle. The worker thread never touches UI.
+
+use std::rc::Rc;
 use std::sync::Arc;
 
-use kanal::Sender;
-use windows_sys::Win32::UI::WindowsAndMessaging::HICON;
-use wgpui::{
-    App, AsyncApp, Context, Entity, Render, Subscription, Window, div, prelude::*, px, rgb,
-};
-use wgpui_kit::base::{Checkbox, CheckboxIndicator, CheckboxState};
-use wgpui_kit::component::Root;
-use wgpui_kit::component::button::Button;
-use wgpui_kit::component::input::{Input, InputEvent, InputState};
-use wgpui_kit::component::scroll::ScrollableElement as _;
-use wgpui_kit::component::theme::{Theme, ThemeMode};
-use wgpui_kit::component::tooltip::Tooltip;
+use kanal::{Receiver, Sender};
+use slint::{ComponentHandle as _, SharedString, VecModel};
 
 use crate::http::ChannelDetail;
-use crate::state::{GuiEvent, SharedSnapshot, Snapshot, UiIntent};
+use crate::state::{GuiEvent, SharedSnapshot, Snapshot, ThemeMode, UiIntent};
 use crate::tray::{Tray, TrayAction};
+use crate::ui::{AppWindow, ChannelRow};
 
-const GREEN: u32 = 0x2e_a043;
-const RED: u32 = 0xda_3633;
-
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-enum Tab {
-    #[default]
-    Channels,
-    FilteredWords,
-}
-
-/// Everything the window builder needs beyond the wgpui contexts. Moved into
-/// the builder closure; the channel ends go to the pump task, the rest lives
-/// on the view entity.
+/// Everything the Slint bootstrap needs. Channel ends go to the pump
+/// thread; the tray and single-instance guard stay alive in `Guards` for
+/// the app lifetime.
 pub struct ViewParams {
     pub ui_tx: Sender<UiIntent>,
     pub shared: Arc<SharedSnapshot>,
-    pub gui_rx: kanal::AsyncReceiver<GuiEvent>,
+    pub gui_rx: Receiver<GuiEvent>,
     pub tray: Option<Tray>,
     pub single: app_single_instance::PrimaryHandle,
 }
 
-pub struct SiphonView {
-    ui_tx: Sender<UiIntent>,
-    shared: Arc<SharedSnapshot>,
-    snapshot_version: u64,
-    snapshot: Snapshot,
-    login_input: Entity<InputState>,
-    word_input: Entity<InputState>,
-    tab: Tab,
-    /// Expanded channel row, showing the resolved detail between the rows.
-    /// Purely presentational: toggled by clicking the channel name.
-    expanded: Option<u64>,
-    /// `None` when the tray icon failed to build: closing the window quits
-    /// instead of hiding, so it can never strand invisible without a tray.
-    /// Also owns the icon; dropping removes it from the tray.
-    tray: Option<Tray>,
-    /// Held alive for the app lifetime; the guard keeps this instance
-    /// primary, so a second launch wakes it instead of starting over.
+/// Owns the tray icon and the primary-instance guard: dropping either
+/// removes the icon or releases primary status, so both outlive `run`.
+pub struct Guards {
+    _tray: Option<Tray>,
     _single: app_single_instance::PrimaryHandle,
-    hwnd: Option<isize>,
-    /// The title/taskbar icon installed by [`build`]; the window only
-    /// stores the handle, so the view owns it until drop.
-    window_icon: Option<HICON>,
-    _subs: Vec<Subscription>,
 }
 
-impl SiphonView {
-    /// Builds the view entity, wires input events and the work→GUI pump, and
-    /// wraps it in the Kit root the window renders.
-    pub fn build(window: &mut Window, cx: &mut App, params: ViewParams) -> Entity<Root> {
-        let login_input = cx.new(|cx| InputState::new(window, cx).placeholder("Add new streamer"));
-        let word_input = cx.new(|cx| InputState::new(window, cx).placeholder("Add filtered word"));
+/// Builds the window, wires callbacks, applies the first snapshot, and
+/// spawns the pump thread that carries later worker events onto the UI.
+pub fn build(params: ViewParams) -> (AppWindow, Guards) {
+    let ui = AppWindow::new().expect("slint window");
+    wire(&ui, &params.ui_tx);
+    let dark = windows_registry_mode()
+        .unwrap_or(ThemeMode::Light)
+        .is_dark();
+    {
         let snapshot = params.shared.read().clone();
-        let snapshot_version = params.shared.version();
-        let hwnd = win_hwnd(window);
-        let window_icon = hwnd.and_then(set_window_icon);
-        let view = cx.new(|_cx| SiphonView {
-            ui_tx: params.ui_tx,
-            shared: params.shared,
-            snapshot_version,
-            snapshot,
-            login_input: login_input.clone(),
-            word_input: word_input.clone(),
-            tab: Tab::Channels,
-            expanded: None,
-            tray: params.tray,
-            _single: params.single,
-            hwnd,
-            window_icon,
-            _subs: Vec::new(),
-        });
-
-        for (input, intent) in [
-            (login_input, UiIntent::AddLogin as fn(String) -> UiIntent),
-            (
-                word_input,
-                UiIntent::AddFilteredWord as fn(String) -> UiIntent,
-            ),
-        ] {
-            view.update(cx, |view, cx| {
-                let ui_tx = view.ui_tx.clone();
-                let sub =
-                    cx.subscribe_in(&input, window, move |_view, state, event, window, cx| {
-                        if matches!(event, InputEvent::PressEnter { .. }) {
-                            submit_input(state, window, cx, &ui_tx, intent);
-                        }
-                    });
-                view._subs.push(sub);
-            });
+        apply_snapshot(&ui, &snapshot);
+        ui.set_dark(dark);
+    }
+    let has_tray = params.tray.is_some();
+    ui.window().on_close_requested(move || {
+        if has_tray {
+            trim_working_set();
+        } else {
+            // Without a tray a hidden window would strand invisible, so a
+            // real quit instead.
+            let _ = slint::quit_event_loop();
         }
-
-        spawn_pump(cx, &view, params.gui_rx);
-        sync_theme(window, cx);
-
-        let close_hwnd = view.read(cx).hwnd;
-        let has_tray = view.read(cx).tray.is_some();
-        window.on_window_should_close(cx, move |_window, cx| {
-            if !has_tray {
-                // Without a tray the window would strand invisible, so
-                // a real quit instead. Explicit quit mode means closing
-                // the last window alone would linger without one.
-                cx.quit();
-                return true;
-            }
-            if let Some(hwnd) = close_hwnd {
-                hide_window(hwnd);
-                log::info!(target: "tray", "close hid to tray");
-            }
-            false
-        });
-
-        cx.new(|cx| Root::new(view, window, cx))
-    }
-}
-
-/// Applies the OS light/dark setting once. Later changes arrive as theme
-/// events from the system watcher. Kit components render from the global
-/// theme, so a change repaints the whole tree without touching view state.
-fn sync_theme(window: &mut Window, cx: &mut App) {
-    apply_system_theme(window, cx);
-}
-
-fn apply_system_theme(window: &mut Window, cx: &mut App) {
-    let mode = windows_registry_mode().unwrap_or_else(|| ThemeMode::from(window.appearance()));
-    log::info!(target: "app", "applying {} theme", mode.name());
-    Theme::change(mode, Some(window), cx);
-    if let Some(hwnd) = win_hwnd(window) {
-        {
-            use windows_sys::Win32::Foundation::HWND;
-            use windows_sys::Win32::Graphics::Dwm::{
-                DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
-            };
-            use windows_sys::core::BOOL;
-
-            let dark: BOOL = i32::from(mode.is_dark());
-
-            unsafe {
-                DwmSetWindowAttribute(
-                    hwnd as HWND,
-                    DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
-                    core::ptr::from_ref(&dark).cast(),
-                    std::mem::size_of::<BOOL>() as u32,
-                );
-            }
-        };
-    }
-}
-
-/// The "default app mode" setting: 0 is dark, anything else is light.
-fn windows_registry_mode() -> Option<ThemeMode> {
-    winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
-        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
-        .and_then(|key| key.get_value::<u32, _>("AppsUseLightTheme"))
-        .map(|light| {
-            if light == 0 {
-                ThemeMode::Dark
-            } else {
-                ThemeMode::Light
-            }
-        })
-        .ok()
+        slint::CloseRequestResponse::HideWindow
+    });
+    spawn_pump(&ui, params.shared.clone(), params.gui_rx);
+    let guards = Guards {
+        _tray: params.tray,
+        _single: params.single,
+    };
+    (ui, guards)
 }
 
 /// Subscribes to the documented system theme notification. Runs on the work
 /// thread: joining the MTA there cannot disturb the foreground thread's
 /// clipboard apartment. The callback reads the reported mode and forwards
-/// it through the frame channel; the pump applies it directly, so
-/// there is no new channel, no new task, and no polling.
+/// it through the frame channel; the pump applies it directly, so there is
+/// no new channel, no new task, and no polling.
 pub fn watch_system_theme(frame: Arc<SharedSnapshot>) {
     use windows::Foundation::TypedEventHandler;
     use windows::UI::ViewManagement::UISettings;
@@ -223,286 +109,227 @@ pub fn watch_system_theme(frame: Arc<SharedSnapshot>) {
     }
 }
 
-/// Foreground task awaiting work→GUI events. Nothing polls: the channel
-/// parks the task until the work thread sends.
-fn spawn_pump(cx: &mut App, view: &Entity<SiphonView>, gui_rx: kanal::AsyncReceiver<GuiEvent>) {
-    let weak = view.downgrade();
-    cx.spawn(async move |cx| {
-        loop {
-            match gui_rx.recv().await {
-                Ok(GuiEvent::Snapshot) => {
-                    if reload_snapshot(&weak, cx).is_err() {
-                        break;
-                    }
-                }
-                Ok(GuiEvent::Theme(mode)) => {
-                    if apply_theme_event(&weak, cx, mode).is_err() {
-                        break;
-                    }
-                }
-                Ok(GuiEvent::Tray(action)) => {
-                    if reload_snapshot(&weak, cx).is_err() || handle_tray(cx, &weak, action).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+/// The "default app mode" setting: 0 is dark, anything else is light.
+fn windows_registry_mode() -> Option<ThemeMode> {
+    winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
+        .and_then(|key| key.get_value::<u32, _>("AppsUseLightTheme"))
+        .map(|light| {
+            if light == 0 {
+                ThemeMode::Dark
+            } else {
+                ThemeMode::Light
+            }
+        })
+        .ok()
+}
+
+/// Forwards Slint callbacks into the work queue. Empty input submits
+/// nothing; a bad row id only logs.
+fn wire(ui: &AppWindow, ui_tx: &Sender<UiIntent>) {
+    ui.on_add_login({
+        let ui_tx = ui_tx.clone();
+        move |text| {
+            let value = text.trim().to_owned();
+            if !value.is_empty() && ui_tx.send(UiIntent::AddLogin(value)).is_err() {
+                log::info!(target: "app", "ui intent send failed");
             }
         }
-    })
-    .detach();
-}
-
-/// Copies a newer snapshot into the view.
-/// Reports whether the view is still alive.
-fn reload_snapshot(weak: &wgpui::WeakEntity<SiphonView>, cx: &mut AsyncApp) -> wgpui::Result<()> {
-    weak.update(cx, |view, cx| {
-        let fresh = view.shared.version();
-        if fresh == view.snapshot_version {
-            return;
+    });
+    ui.on_remove_channel({
+        let ui_tx = ui_tx.clone();
+        move |id| match id.parse::<u64>() {
+            Ok(channel) => {
+                if ui_tx.send(UiIntent::RemoveChannel(channel)).is_err() {
+                    log::info!(target: "app", "ui intent send failed");
+                }
+            }
+            Err(_) => log::info!(target: "app", "bad channel id {id}"),
         }
-        view.snapshot = view.shared.read().clone();
-        view.snapshot_version = fresh;
-        cx.notify();
-    })
-}
-
-/// Applies a system theme event. The watcher reported the mode, so it
-/// applies directly with no re-read; the notify repaints with the new
-/// colors. Reports whether the view is still alive.
-fn apply_theme_event(
-    weak: &wgpui::WeakEntity<SiphonView>,
-    cx: &mut AsyncApp,
-    mode: ThemeMode,
-) -> wgpui::Result<()> {
-    weak.update(cx, |_view, cx| {
-        log::info!(target: "app", "applying {} theme", mode.name());
-        Theme::change(mode, None, cx);
-        cx.notify();
-    })
-}
-
-/// Applies one tray or single-instance action. Shows the window or quits the
-/// app; both ride the pump so no thread ever touches UI state directly.
-fn handle_tray(
-    cx: &mut AsyncApp,
-    weak: &wgpui::WeakEntity<SiphonView>,
-    action: TrayAction,
-) -> wgpui::Result<()> {
-    match action {
-        TrayAction::Show => {
-            log::info!(target: "tray", "tray Open, showing window");
-            let hwnd = weak.update(cx, |view, _cx| view.hwnd)?;
-            if let Some(hwnd) = hwnd {
-                show_window(hwnd);
+    });
+    ui.on_add_word({
+        let ui_tx = ui_tx.clone();
+        move |text| {
+            let value = text.trim().to_owned();
+            if !value.is_empty() && ui_tx.send(UiIntent::AddFilteredWord(value)).is_err() {
+                log::info!(target: "app", "ui intent send failed");
             }
         }
-        TrayAction::Quit => {
-            cx.update(|cx| cx.quit()).ok();
+    });
+    ui.on_remove_word({
+        let ui_tx = ui_tx.clone();
+        move |index| {
+            if index >= 0 {
+                let word = index as usize;
+                if ui_tx.send(UiIntent::RemoveFilteredWord(word)).is_err() {
+                    log::info!(target: "app", "ui intent send failed");
+                }
+            }
         }
-    }
-    Ok(())
-}
-
-/// Reads an input field, clears it, and sends the value as an intent. Empty
-/// input submits nothing.
-fn submit_input(
-    input: &Entity<InputState>,
-    window: &mut Window,
-    cx: &mut App,
-    ui_tx: &Sender<UiIntent>,
-    intent: fn(String) -> UiIntent,
-) {
-    let value: String = input.read(cx).value().trim().to_owned();
-    if value.is_empty() {
-        return;
-    }
-    input.update(cx, |state, cx| state.set_value("", window, cx));
-    if ui_tx.send(intent(value)).is_err() {
-        log::info!(target: "app", "ui intent send failed");
-    }
-}
-
-impl Render for SiphonView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let root = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_4()
-            .size_full()
-            .child(header(self, cx))
-            .child(tabs(self, cx));
-
-        let mut middle = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .gap_2()
-            .overflow_y_scrollbar();
-
-        match self.tab {
-            Tab::Channels => middle = middle.child(channel_list(self, cx)),
-            Tab::FilteredWords => middle = middle.child(word_list(self, cx)),
+    });
+    ui.on_set_notify({
+        let ui_tx = ui_tx.clone();
+        move |checked| {
+            if ui_tx
+                .send(UiIntent::SetNotifyTitleChanges(checked))
+                .is_err()
+            {
+                log::info!(target: "app", "ui intent send failed");
+            }
         }
-
-        // The middle content absorbs free space, so the input row and
-        // toggles below stay pinned to the bottom of the window.
-        root.child(middle)
-            .child(input_row(self, cx))
-            .child(toggles(self, cx))
-            .child(error_row(self))
-    }
+    });
+    ui.on_set_sound({
+        let ui_tx = ui_tx.clone();
+        move |checked| {
+            if ui_tx.send(UiIntent::SetSound(checked)).is_err() {
+                log::info!(target: "app", "ui intent send failed");
+            }
+        }
+    });
+    ui.on_apply_update({
+        let ui_tx = ui_tx.clone();
+        move || {
+            if ui_tx.send(UiIntent::ApplyUpdate).is_err() {
+                log::info!(target: "app", "ui intent send failed");
+            }
+        }
+    });
+    ui.on_clear_error({
+        let ui_tx = ui_tx.clone();
+        move || {
+            if ui_tx.send(UiIntent::ClearError).is_err() {
+                log::info!(target: "app", "ui intent send failed");
+            }
+        }
+    });
 }
 
-fn header(view: &SiphonView, _cx: &mut Context<SiphonView>) -> impl IntoElement {
-    let mut row = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .child(div().text_xl().child("Siphon"))
-        .child(connection(view));
-
-    if let Some(offer) = &view.snapshot.update {
-        let ui_tx = view.ui_tx.clone();
-        row = row.child(
-            Button::new("update")
-                .label(format!("Update to {}", offer.version))
-                .on_click(move |_, _, _| {
-                    let _ = ui_tx.send(UiIntent::ApplyUpdate);
-                }),
-        );
-    }
-    row
-}
-
-fn connection(view: &SiphonView) -> impl IntoElement {
-    let (text, color) = connection_text(view.snapshot.connected, view.snapshot.conn_error.as_deref());
-    div().text_color(rgb(color)).child(text.to_owned())
-}
-
-fn tabs(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoElement {
-    let channels = Button::new("tab-channels")
-        .label(if view.tab == Tab::Channels {
-            "» Channels"
-        } else {
-            "Channels"
+/// Dedicated pump thread: blocks on the worker channel and replays each
+/// event onto the UI thread through the weak handle. A dead window ends
+/// the loop; the snapshot clone keeps the lock section short.
+fn spawn_pump(ui: &AppWindow, shared: Arc<SharedSnapshot>, gui_rx: Receiver<GuiEvent>) {
+    let weak = ui.as_weak();
+    std::thread::Builder::new()
+        .name("slint pump".to_owned())
+        .spawn(move || {
+            while let Ok(event) = gui_rx.recv() {
+                match event {
+                    GuiEvent::Snapshot => {
+                        let snapshot = shared.read().clone();
+                        if weak
+                            .upgrade_in_event_loop(move |ui| apply_snapshot(&ui, &snapshot))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    GuiEvent::Theme(mode) => {
+                        let dark = mode.is_dark();
+                        log::info!(target: "app", "applying {} theme", mode.name());
+                        if weak
+                            .upgrade_in_event_loop(move |ui| ui.set_dark(dark))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    GuiEvent::Tray(action) => {
+                        // Tray handling reloads the snapshot too.
+                        let snapshot = shared.read().clone();
+                        if weak
+                            .upgrade_in_event_loop(move |ui| {
+                                apply_snapshot(&ui, &snapshot);
+                                match action {
+                                    TrayAction::Show => {
+                                        log::info!(target: "tray", "tray Open, showing window");
+                                        let _ = ui.window().show();
+                                    }
+                                    TrayAction::Quit => {
+                                        let _ = slint::quit_event_loop();
+                                    }
+                                }
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
         })
-        .on_click(cx.listener(|this: &mut SiphonView, _event, _window, cx| {
-            this.tab = Tab::Channels;
-            cx.notify();
-        }));
-    let words = Button::new("tab-words")
-        .label(if view.tab == Tab::FilteredWords {
-            "» Filtered words"
-        } else {
-            "Filtered words"
-        })
-        .on_click(cx.listener(|this: &mut SiphonView, _event, _window, cx| {
-            this.tab = Tab::FilteredWords;
-            cx.notify();
-        }));
-    div().flex().flex_row().gap_2().child(channels).child(words)
+        .expect("slint pump thread");
 }
 
-fn channel_list(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoElement {
-    if view.snapshot.config.channels.is_empty() && view.snapshot.pending.is_empty() {
-        return div().child("No channels configured. Add a streamer below.");
-    }
-    let mut list = div().flex().flex_col().gap_1();
-    list = list.child(
-        div()
-            .flex()
-            .flex_row()
-            .gap_2()
-            .child(div().flex_1().child("Channel"))
-            .child(div().flex_1().child("Title"))
-            .child(div().w(px(90.)).child("Viewers"))
-            .child(div().w(px(36.)).child("")),
-    );
-    for channel in &view.snapshot.config.channels {
-        let resolved = view.snapshot.channels.get(&channel.id);
-        let name = resolved
-            .map(|entry| entry.display_name.as_str())
-            .or(channel.display_name.as_deref())
-            .unwrap_or(channel.login.as_str());
-        let title = resolved
-            .and_then(|entry| entry.stream_title.clone())
-            .unwrap_or_default();
-        let viewers = resolved.map_or("—".to_owned(), live_viewers);
-        let id = channel.id;
-        let login = channel.login.clone();
-        let ui_tx = view.ui_tx.clone();
-        let expanded = view.expanded == Some(id);
-        let channel_tip = format!("id {id}");
-        let name_cell = div().flex_1().child(
-            div()
-                .id(format!("channel-name-{id}"))
-                .cursor_pointer()
-                .on_click(cx.listener(move |this: &mut SiphonView, _event, _window, cx| {
-                    this.expanded = if this.expanded == Some(id) { None } else { Some(id) };
-                    cx.notify();
-                }))
-                .tooltip(move |window, cx| Tooltip::new(channel_tip.clone()).build(window, cx))
-                .child(name.to_owned()),
-        );
-        // The detail renders below the row, never inside it, so the name,
-        // title, viewers, and close button keep their positions when it
-        // opens.
-        let mut wrapper = div().flex().flex_col().gap_1().child(
-            div()
-                .flex()
-                .flex_row()
-                .gap_2()
-                .items_center()
-                .child(name_cell)
-                .child(div().flex_1().child(title.clone()))
-                .child(div().w(px(90.)).child(viewers.clone()))
-                .child(Button::new(format!("remove-{id}")).label("×").on_click(
-                    move |_, _, _| {
-                        log::info!(target: "app", "remove requested for {login}");
-                        let _ = ui_tx.send(UiIntent::RemoveChannel(id));
-                    },
-                )),
-        );
-        if expanded && let Some(entry) = resolved {
-            wrapper = wrapper.child(channel_detail(entry, cx));
+/// Copies one worker snapshot onto the retained properties. Rows follow
+/// config order with pending logins appended; the string id round-trips
+/// back through `remove-channel` without a Rust-side row mirror.
+fn apply_snapshot(ui: &AppWindow, snapshot: &Snapshot) {
+    let (text, ok) = connection_text(snapshot.connected, snapshot.conn_error.as_deref());
+    ui.set_conn_text(SharedString::from(text));
+    ui.set_conn_ok(ok);
+    ui.set_error_text(SharedString::from(snapshot.error.as_str()));
+    match &snapshot.update {
+        Some(offer) => {
+            let version = &offer.version;
+            ui.set_has_update(true);
+            ui.set_update_text(SharedString::from(format!("Update to {version}").as_str()));
         }
-        list = list.child(wrapper);
+        None => {
+            ui.set_has_update(false);
+            ui.set_update_text(SharedString::new());
+        }
     }
-    for login in &view.snapshot.pending {
-        list = list.child(
-            div()
-                .flex()
-                .flex_row()
-                .gap_2()
-                .items_center()
-                .child(div().flex_1().child(login.clone()))
-                .child(div().flex_1().child("…"))
-                .child(div().w(px(90.)).child("…"))
-                .child(div().w(px(36.)).child("…")),
-        );
-    }
-    list
+    ui.set_notify_titles(snapshot.config.notify_title_changes);
+    ui.set_sound(snapshot.config.sound);
+    let rows: Vec<ChannelRow> = snapshot
+        .config
+        .channels
+        .iter()
+        .map(|channel| {
+            let resolved = snapshot.channels.get(&channel.id);
+            let name = resolved
+                .map(|entry| entry.display_name.as_str())
+                .or(channel.display_name.as_deref())
+                .unwrap_or(channel.login.as_str());
+            let title = resolved
+                .and_then(|entry| entry.stream_title.clone())
+                .unwrap_or_default();
+            let viewers = resolved.map_or("—".to_owned(), live_viewers);
+            ChannelRow {
+                id: SharedString::from(channel.id.to_string().as_str()),
+                name: SharedString::from(name),
+                title: SharedString::from(title.as_str()),
+                viewers: SharedString::from(viewers.as_str()),
+                detail: SharedString::from(detail_line(channel.login.as_str(), resolved).as_str()),
+                pending: false,
+            }
+        })
+        .chain(snapshot.pending.iter().map(|login| ChannelRow {
+            id: SharedString::new(),
+            name: SharedString::from(login.as_str()),
+            title: SharedString::from("…"),
+            viewers: SharedString::from("…"),
+            detail: SharedString::new(),
+            pending: true,
+        }))
+        .collect();
+    ui.set_channels(Rc::new(VecModel::from(rows)).into());
+    let words: Vec<SharedString> = snapshot
+        .config
+        .filtered_words
+        .iter()
+        .map(|word| SharedString::from(word.as_str()))
+        .collect();
+    ui.set_words(Rc::new(VecModel::from(words)).into());
 }
 
 /// Expanded detail under its channel row: the real (login) name alongside
 /// the current title, viewers, game, and start time from the last resolve.
-/// The muted background groups it with the row above. Hovering the login
-/// shows the channel id, hovering the title shows the stream id, hovering
-/// the game shows the game id.
-fn channel_detail(channel: &ChannelDetail, cx: &App) -> impl IntoElement {
-    let channel_tip = format!("id {}", channel.id);
-    let stream_tip = if channel.stream_id == 0 {
-        "no stream".to_owned()
-    } else {
-        format!("stream {}", channel.stream_id)
+fn detail_line(login: &str, channel: Option<&ChannelDetail>) -> String {
+    let Some(entry) = channel else {
+        return String::new();
     };
-    let game_tip = channel
-        .game
-        .as_ref()
-        .map_or("no game".to_owned(), |game| format!("game {}", game.id));
-    let game_label = channel
+    let game = entry
         .game
         .as_ref()
         .map(|game| {
@@ -513,60 +340,9 @@ fn channel_detail(channel: &ChannelDetail, cx: &App) -> impl IntoElement {
             }
         })
         .unwrap_or("no game");
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .text_sm()
-        .rounded(px(4.))
-        .p_2()
-        .bg(Theme::global(cx).muted)
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .id(format!("channel-login-{}", channel.id))
-                        .tooltip(move |window, cx| {
-                            Tooltip::new(channel_tip.clone()).build(window, cx)
-                        })
-                        .child(channel.login.clone()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .id(format!("stream-title-{}", channel.id))
-                        .tooltip(move |window, cx| {
-                            Tooltip::new(stream_tip.clone()).build(window, cx)
-                        })
-                        .child(
-                            channel
-                                .stream_title
-                                .clone()
-                                .unwrap_or_else(|| "no title".to_owned()),
-                        ),
-                )
-                .child(div().child(viewers_text(channel))),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .gap_2()
-                .child(div().flex_1().child(format_stream_start(channel.stream_start)))
-                .child(
-                    div()
-                        .flex_1()
-                        .id(format!("game-{}", channel.id))
-                        .tooltip(move |window, cx| {
-                            Tooltip::new(game_tip.clone()).build(window, cx)
-                        })
-                        .child(game_label.to_owned()),
-                ),
-        )
+    let start = format_stream_start(entry.stream_start);
+    let counts = viewers_text(entry);
+    format!("{login} • {game} • {start} • {counts}")
 }
 
 /// Collapsed-row liveness: `offline` when the channel is offline, the
@@ -601,231 +377,12 @@ fn format_stream_start(start: Option<i64>) -> String {
     crate::logging::format_iso_ms(millis)
 }
 
-fn word_list(view: &SiphonView, _cx: &mut Context<SiphonView>) -> impl IntoElement {    let mut row = div().flex().flex_row().flex_wrap().gap_1();
-    for (index, word) in view.snapshot.config.filtered_words.iter().enumerate() {
-        let ui_tx = view.ui_tx.clone();
-        let label = format!("{word} ×");
-        row = row.child(Button::new(format!("word-{index}")).label(label).on_click(
-            move |_, _, _| {
-                let _ = ui_tx.send(UiIntent::RemoveFilteredWord(index));
-            },
-        ));
-    }
-    if view.snapshot.config.filtered_words.is_empty() {
-        row = row.child("No filtered words. Add one below.");
-    }
-    row
-}
-
-fn input_row(view: &SiphonView, _cx: &mut Context<SiphonView>) -> impl IntoElement {
-    let (input, intent): (&Entity<InputState>, fn(String) -> UiIntent) = match view.tab {
-        Tab::Channels => (&view.login_input, UiIntent::AddLogin),
-        Tab::FilteredWords => (&view.word_input, UiIntent::AddFilteredWord),
-    };
-    let input = input.clone();
-    let ui_tx = view.ui_tx.clone();
-    div()
-        .flex()
-        .flex_row()
-        .gap_2()
-        .child(div().flex_1().child(Input::new(&input)))
-        .child(
-            Button::new("add")
-                .label("Add")
-                .on_click(move |_, window, cx| {
-                    submit_input(&input, window, cx, &ui_tx, intent);
-                }),
-        )
-}
-
-fn toggles(view: &SiphonView, cx: &mut Context<SiphonView>) -> impl IntoElement {
-    let theme = Theme::global(cx);
-    let dark = theme.is_dark();
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .text_color(theme.foreground)
-        .child(toggle_row(
-            "notify-titles",
-            "Notify on title changes while offline",
-            view.snapshot.config.notify_title_changes,
-            dark,
-            view.ui_tx.clone(),
-            UiIntent::SetNotifyTitleChanges,
-        ))
-        .child(toggle_row(
-            "sound",
-            "Notification sound",
-            view.snapshot.config.sound,
-            dark,
-            view.ui_tx.clone(),
-            UiIntent::SetSound,
-        ))
-}
-
-/// Solid-fill box colors, picked per theme mode so the state reads at a
-/// glance: green when checked, monochrome when not. The tick contrasts
-/// with the checked fill it sits on.
-const CHECKED_FILL_LIGHT: u32 = 0x16_6534;
-const CHECKED_FILL_DARK: u32 = 0x4a_de80;
-const UNCHECKED_FILL_LIGHT: u32 = 0x00_0000;
-const UNCHECKED_FILL_DARK: u32 = 0xff_ffff;
-const TICK_ON_DARK_GREEN: u32 = 0xff_ffff;
-const TICK_ON_LIGHT_GREEN: u32 = 0x00_0000;
-
-/// One labeled toggle on the unstyled base checkbox, which keeps toggle,
-/// focus, keyboard, and accessibility behavior while the app owns every
-/// pixel of the box.
-fn toggle_row(
-    id: &'static str,
-    label: &'static str,
-    checked: bool,
-    dark: bool,
-    ui_tx: Sender<UiIntent>,
-    intent: fn(bool) -> UiIntent,
-) -> impl IntoElement {
-    let fill = if checked {
-        if dark {
-            CHECKED_FILL_DARK
-        } else {
-            CHECKED_FILL_LIGHT
-        }
-    } else if dark {
-        UNCHECKED_FILL_DARK
-    } else {
-        UNCHECKED_FILL_LIGHT
-    };
-    let tick = if dark {
-        TICK_ON_LIGHT_GREEN
-    } else {
-        TICK_ON_DARK_GREEN
-    };
-    Checkbox::new(id)
-        .checked(checked)
-        .accessibility_label(label)
-        .on_change(move |state, _event, _window, _cx| {
-            let _ = ui_tx.send(intent(matches!(state, CheckboxState::Checked)));
-        })
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_2()
-        .cursor_pointer()
-        .child(
-            CheckboxIndicator::new()
-                .checked(checked)
-                .size_4()
-                .flex()
-                .items_center()
-                .justify_center()
-                .flex_shrink_0()
-                .border_1()
-                .rounded(px(4.))
-                .bg(rgb(fill))
-                .border_color(rgb(fill))
-                .text_color(rgb(tick))
-                .text_sm()
-                .child(if checked { div().child("✓") } else { div() }),
-        )
-        .child(div().child(label.to_owned()))
-}
-
-fn error_row(view: &SiphonView) -> impl IntoElement {
-    if view.snapshot.error.is_empty() {
-        return div();
-    }
-    let ui_tx = view.ui_tx.clone();
-    div()
-        .flex()
-        .flex_row()
-        .gap_2()
-        .items_center()
-        .child(
-            div()
-                .flex_1()
-                .text_color(rgb(RED))
-                .child(view.snapshot.error.clone()),
-        )
-        .child(Button::new("dismiss").label("×").on_click(move |_, _, _| {
-            let _ = ui_tx.send(UiIntent::ClearError);
-        }))
-}
-
-fn connection_text(connected: bool, error: Option<&str>) -> (&str, u32) {
+fn connection_text(connected: bool, error: Option<&str>) -> (&str, bool) {
     if connected {
-        ("Connected", GREEN)
+        ("Connected", true)
     } else {
-        (error.unwrap_or("Connecting…"), RED)
+        (error.unwrap_or("Connecting…"), false)
     }
-}
-
-/// Raw Win32 handle for our own window. wgpui exposes no hide API, so
-/// visibility goes through Win32.
-fn win_hwnd(window: &Window) -> Option<isize> {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-    HasWindowHandle::window_handle(window)
-        .ok()
-        .and_then(|handle| match handle.as_raw() {
-            RawWindowHandle::Win32(win) => Some(win.hwnd.get()),
-            _ => None,
-        })
-}
-
-/// Assigns the bundled icon to our own window for the taskbar and title
-/// bar; wgpui exposes no icon API, so this goes through `WM_SETICON`
-/// directly. Returns the icon for the view to own: the window only stores
-/// the handle, so freeing it would blank the icon.
-fn set_window_icon(hwnd: isize) -> Option<HICON> {
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
-    use windows_sys::Win32::UI::WindowsAndMessaging as wam;
-
-    let icon = match crate::tray::load_icon() {
-        Ok(icon) => icon,
-        Err(error) => {
-            log::error!(target: "app", "window icon load failed: {error}");
-            return None;
-        }
-    };
-    // SAFETY: `hwnd` is our own live window; `WM_SETICON` only stores the
-    // handle for the shell to paint.
-    unsafe {
-        wam::SendMessageW(
-            hwnd as HWND,
-            wam::WM_SETICON,
-            wam::ICON_SMALL as WPARAM,
-            icon as LPARAM,
-        );
-        wam::SendMessageW(hwnd as HWND, wam::WM_SETICON, wam::ICON_BIG as WPARAM, icon as LPARAM);
-    }
-    Some(icon)
-}
-
-impl Drop for SiphonView {
-    fn drop(&mut self) {
-        if let Some(icon) = self.window_icon {
-            use windows_sys::Win32::UI::WindowsAndMessaging as wam;
-
-            // SAFETY: icon installed by `set_window_icon` and owned by
-            // this view.
-            unsafe { wam::DestroyIcon(icon) };
-        }
-    }
-}
-
-/// The close button hides to the tray; without a tray it would strand
-/// invisible, so this helper is only used when one exists.
-fn hide_window(hwnd: isize) {
-    use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::WindowsAndMessaging as wam;
-
-    // SAFETY: `hwnd` is our own live window; `ShowWindow` only toggles
-    // visibility.
-    unsafe {
-        wam::ShowWindow(hwnd as HWND, wam::SW_HIDE);
-    }
-    trim_working_set();
 }
 
 /// A hidden tray app needs no resident pages: page everything out and let
@@ -854,19 +411,6 @@ fn trim_working_set() {
                 counters.WorkingSetSize / 1024 / 1024,
             );
         }
-    }
-}
-
-/// Unhide + focus our own window.
-fn show_window(hwnd: isize) {
-    use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::WindowsAndMessaging as wam;
-
-    log::info!(target: "tray", "show requested (hwnd={hwnd:?})");
-    // SAFETY: `hwnd` is our own live window.
-    unsafe {
-        wam::ShowWindow(hwnd as HWND, wam::SW_SHOWDEFAULT);
-        wam::SetForegroundWindow(hwnd as HWND);
     }
 }
 

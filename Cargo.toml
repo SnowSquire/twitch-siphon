@@ -8,16 +8,25 @@ license = "Apache-2.0"
 edition = "2024"
 
 [dependencies]
-# UI: wgpui (retained, wgpu + winit) with the Kit component façade for inputs
-# and buttons. Backend selection follows wgpui's wgpu (Vulkan); there is no
-# backend pinning here.
-wgpui = "0.3.6"
-wgpui-kit = "0.6.1"
-# Sync+async MPMC channels bridging the GUI thread and the work runtime.
+# UI: Slint (retained). Layout lives in `ui/siphon.slint`, compiled by
+# `slint-build` in `build.rs`; `src/app.rs` only maps the worker `Snapshot`
+# onto properties and forwards callbacks as `UiIntent`s. Video later rides
+# `Image::try_from(wgpu::Texture)` zero-copy imports, never CPU copies.
+slint = "1.18"
+# Sync MPMC channels bridging the GUI thread and the work runtime.
+# Sole rustls crypto provider, enabled explicitly: hyper-rustls in wgpui's
+# tree used to switch `ring` on transitively, and provider auto-detection
+# panics with zero providers (or more than one). Mirrors hyper-rustls's
+# rustls features so protocol and logging behavior stay as they were.
+rustls = { version = "0.23", default-features = false, features = [
+  "logging",
+  "ring",
+  "std",
+  "tls12",
+] }
 kanal = "0.1"
 anyhow = "1"
 app-single-instance = "0.1"
-raw-window-handle = "0.6"
 dirs = "6"
 open = "5"
 env_logger = "0.11"
@@ -68,6 +77,9 @@ windows-sys = { version = "0.61", features = [
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+slint-build = "1.18"
 
 [package.metadata.packager]
 productName = "Siphon"

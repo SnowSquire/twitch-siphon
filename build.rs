@@ -5,4 +5,5 @@
 fn main() {
     println!("cargo::rerun-if-changed=Cargo.toml");
     println!("cargo::rerun-if-changed=src");
+    slint_build::compile("ui/siphon.slint").expect("slint UI compiles");
 }

@@ -1,0 +1,232 @@
+// Siphon main window (Slint, retained). Purely presentational: every row
+// renders a property of the worker `Snapshot`, every interaction is a
+// callback that `src/app.rs` forwards as a `UiIntent`. Video later lands as
+// an `Image` element backed by a zero-copy `wgpu::Texture` import.
+
+import { Button, LineEdit, CheckBox, ListView, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+struct ChannelRow {
+    id: string,
+    name: string,
+    title: string,
+    viewers: string,
+    detail: string,
+    pending: bool,
+}
+
+export component AppWindow inherits Window {
+    title: "Siphon";
+    icon: @image-url("../icons/icon.png");
+    min-width: 420px;
+    min-height: 520px;
+    preferred-width: 460px;
+    preferred-height: 620px;
+    background: dark ? #1b1b1b : #ffffff;
+
+    in property <string> conn-text: "Connecting…";
+    in property <bool> conn-ok: false;
+    in property <string> error-text: "";
+    in property <bool> has-update: false;
+    in property <string> update-text: "";
+    in property <bool> dark: false;
+    in property <bool> notify-titles: false;
+    in property <bool> sound: true;
+    in property <[ChannelRow]> channels;
+    in property <[string]> words;
+    in-out property <int> tab: 0;
+
+    callback add-login(string);
+    callback remove-channel(string);
+    callback add-word(string);
+    callback remove-word(int);
+    callback set-notify(bool);
+    callback set-sound(bool);
+    callback apply-update();
+    callback clear-error();
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 8px;
+
+        HorizontalBox {
+            spacing: 8px;
+            alignment: LayoutAlignment.space-between;
+
+            Text {
+                text: "Siphon";
+                font-size: 20px;
+                font-weight: 700;
+                color: dark ? #ffffff : #000000;
+                vertical-alignment: center;
+            }
+
+            Text {
+                text: conn-text;
+                color: conn-ok ? #2ea043 : #da3633;
+                vertical-alignment: center;
+            }
+        }
+
+        if has-update: Button {
+            text: update-text;
+            clicked => { apply-update(); }
+        }
+
+        HorizontalBox {
+            spacing: 8px;
+
+            Button {
+                text: tab == 0 ? "» Channels" : "Channels";
+                clicked => { tab = 0; }
+            }
+
+            Button {
+                text: tab == 1 ? "» Filtered words" : "Filtered words";
+                clicked => { tab = 1; }
+            }
+        }
+
+        if tab == 0: HorizontalBox {
+            spacing: 8px;
+
+            Text {
+                text: "Channel";
+                horizontal-stretch: 1;
+                font-weight: 700;
+                color: dark ? #ffffff : #000000;
+            }
+
+            Text {
+                text: "Title";
+                horizontal-stretch: 1;
+                font-weight: 700;
+                color: dark ? #ffffff : #000000;
+            }
+
+            Text {
+                text: "Viewers";
+                width: 70px;
+                font-weight: 700;
+                color: dark ? #ffffff : #000000;
+            }
+
+            Text {
+                text: "";
+                width: 32px;
+            }
+        }
+
+        if tab == 0: channel-list := ListView {
+            vertical-stretch: 1;
+
+            for row in channels: VerticalBox {
+                spacing: 0px;
+
+                HorizontalBox {
+                    spacing: 8px;
+
+                    Text {
+                        text: row.name;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                        color: dark ? #ffffff : #000000;
+                    }
+
+                    Text {
+                        text: row.title;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                        color: dark ? #aaaaaa : #555555;
+                    }
+
+                    Text {
+                        text: row.viewers;
+                        width: 70px;
+                        overflow: elide;
+                        color: dark ? #ffffff : #000000;
+                    }
+
+                    if !row.pending: Button {
+                        text: "×";
+                        width: 32px;
+                        clicked => { remove-channel(row.id); }
+                    }
+                }
+
+                if row.detail != "": Text {
+                    text: row.detail;
+                    font-size: 12px;
+                    overflow: elide;
+                    color: dark ? #888888 : #666666;
+                }
+            }
+        }
+
+        if tab == 1: word-list := ListView {
+            vertical-stretch: 1;
+
+            for word[idx] in words: HorizontalBox {
+                Button {
+                    text: word + "  ×";
+                    clicked => { remove-word(idx); }
+                }
+            }
+        }
+
+        if tab == 1 && words.length == 0: Text {
+            text: "No filtered words. Add one below.";
+            color: dark ? #aaaaaa : #555555;
+        }
+
+        HorizontalBox {
+            spacing: 8px;
+
+            entry := LineEdit {
+                horizontal-stretch: 1;
+                placeholder-text: tab == 0 ? "Add new streamer" : "Add filtered word";
+                accepted(text) => {
+                    if (tab == 0 && text != "") { add-login(text); }
+                    if (tab == 1 && text != "") { add-word(text); }
+                    self.text = "";
+                }
+            }
+
+            Button {
+                text: "Add";
+                clicked => {
+                    if (tab == 0 && entry.text != "") { add-login(entry.text); }
+                    if (tab == 1 && entry.text != "") { add-word(entry.text); }
+                    entry.text = "";
+                }
+            }
+        }
+
+        CheckBox {
+            text: "Notify on title changes while offline";
+            checked: notify-titles;
+            toggled => { set-notify(self.checked); }
+        }
+
+        CheckBox {
+            text: "Notification sound";
+            checked: sound;
+            toggled => { set-sound(self.checked); }
+        }
+
+        if error-text != "": HorizontalBox {
+            spacing: 8px;
+
+            Text {
+                text: error-text;
+                horizontal-stretch: 1;
+                wrap: word-wrap;
+                color: #da3633;
+            }
+
+            Button {
+                text: "×";
+                clicked => { clear-error(); }
+            }
+        }
+    }
+}
