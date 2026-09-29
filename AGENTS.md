@@ -3,7 +3,7 @@
 ## Commands
 
 - `cargo run` / `cargo test` / `cargo build --release` — single binary crate `siphon`; binary lands at `target/release/siphon.exe`.
-- `cargo clippy --all-targets --locked` — must be clean: workspace lints deny warnings plus clippy `all`/`pedantic`/`nursery`. Plain clippy is enough; CI adds only a check-only Windows pass: `cargo clippy --all-targets --locked --target x86_64-pc-windows-msvc` (never links, no MSVC needed).
+- `cargo clippy --all-targets --locked` — must be clean: workspace lints deny warnings plus clippy `all`/`pedantic`/`nursery`. Plain clippy is enough locally; CI runs only the check-only Windows pass: `cargo clippy --all-targets --locked --target x86_64-pc-windows-msvc` (never links, no MSVC needed). No Linux clippy: the crate is Windows-only and cannot compile for Linux.
 - Windows-only: no Linux/macOS targets. Builds need just the Rust toolchain
 - plus MSVC for linking.
 - Tests are offline-safe (`cargo test` needs no network/services): GQL decode fixtures, loopback HTTP server, temp files under `%TEMP%/siphon-*-<pid>.*`. Releases (`release.yml`): `v*` tag pushes reuse the tag; manual `workflow_dispatch` mints `<UTC-date>@<short-sha>` via the `setup` job (never a branch name). The upload stays `draft: true` (required for immutable releases); publishing is manual. Artifacts: portable exe + MSI (self-hosted cross-build, WiX on `windows-latest`); not a local concern. The MSI is per-user (no elevation, `%LocalAppData%`) via a frozen WiX template at `packaging/wix/main.wxs` — cargo-packager 0.11.8 has no scope option, so re-diff against upstream when bumping it.

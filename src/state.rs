@@ -251,7 +251,7 @@ pub struct Worker {
     pub(crate) shared: SharedFrame,
     pub(crate) ui_rx: kanal::AsyncReceiver<UiIntent>,
     pub(crate) tray_rx: kanal::AsyncReceiver<TrayAction>,
-    pub(crate) channels: HashMap<u64, http::ResolvedChannel>,
+    pub(crate) channels: HashMap<u64, (http::ResolvedChannel, Option<Instant>)>,
     pub(crate) subs: HashMap<Topic, Sub>,
     pub(crate) matcher: Matcher,
     pub(crate) socket: Option<WsStream>,
@@ -298,21 +298,9 @@ impl Worker {
         worker
     }
 
-    /// Publishes the slot without changing it: for startup, so the GUI
-    /// (which loaded version 0 before this thread started) reloads.
-    pub fn publish(&self) {
-        self.shared.update(|_| {});
-    }
-
     pub(crate) fn set_error(&self, message: String) {
         self.shared.update(|state| {
             state.error = message;
-        });
-    }
-
-    pub(crate) fn clear_error(&self) {
-        self.shared.update(|state| {
-            state.error.clear();
         });
     }
 
@@ -323,7 +311,7 @@ impl Worker {
         let mut channels: Vec<ChannelStatus> = self
             .channels
             .iter()
-            .map(|(id, user)| ChannelStatus {
+            .map(|(id, (user, _))| ChannelStatus {
                 channel_id: *id,
                 login: user.channel_name.clone(),
                 display_name: user.channel_display_name.clone(),
@@ -352,10 +340,6 @@ impl Worker {
         });
     }
 
-    /// Persists the latest config without stalling the loop: the config
-    /// is cloned out from under a short read (the only thing serialization
-    /// needs) and the write runs as a job. Failures surface as an error;
-    /// successes change nothing — the mutation already published.
     pub(crate) fn queue_save(&mut self) {
         let path = self.config_path.clone();
         let config = self.shared.read().config.clone();
@@ -364,9 +348,6 @@ impl Worker {
         }));
     }
 
-    /// Shows a toast without stalling the loop: resolving the avatar and
-    /// handing off parks only this job, so intents and socket traffic keep
-    /// flowing while the image downloads.
     pub(crate) fn queue_toast(
         &mut self,
         summary: String,
@@ -380,7 +361,7 @@ impl Worker {
             JobDone::ToastShown
         }));
     }
-
+    // OZEN: why does this exist, I believe it's because we inject our own 'tray' events, but in that case they shouldn't be called tray events and instead something else
     pub(crate) fn forward_tray(&self, action: TrayAction) {
         self.shared.notify_tray(action);
     }

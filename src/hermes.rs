@@ -21,6 +21,9 @@ const HERMES_URL: &str = "wss://hermes.twitch.tv/v1?clientId=kimne78kx3ncx6brgo4
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
 const KEEPALIVE_MISSED_LIMIT: u64 = 2;
+/// How long after a `stream-down` a channel's toasts stay muted. Restreams
+/// within this window update state silently instead of notifying again.
+const OFFLINE_QUIET: Duration = Duration::from_secs(10 * 60);
 
 pub(crate) type WsStream = WebSocketStream<TcpStream>;
 
@@ -36,9 +39,9 @@ pub(crate) struct Sub {
     state: SubState,
 }
 
-/// Folds `words` for the byte-exact matcher and builds it. Called once at
-/// startup and again on every filter change, so the live matcher always
-/// reflects the persisted list.
+/// Builds the matcher over `words`. Called once at startup and again on
+/// every filter change, so the live matcher always reflects the persisted
+/// list. Case is folded inside the matcher, so words pass through as-is.
 pub(crate) fn build_matcher(words: &[String]) -> Matcher {
     Matcher::new(
         &words
@@ -46,14 +49,23 @@ pub(crate) fn build_matcher(words: &[String]) -> Matcher {
             // An empty pattern matches everything; it can only come from
             // a hand-edited config, so drop it rather than muting all.
             .filter(|word| !word.is_empty())
-            .map(|word| word.to_lowercase())
+            .cloned()
             .collect::<Vec<_>>(),
     )
 }
 
 impl Worker {
-    fn title_filtered(&self, title: &str) -> bool {
-        self.matcher.is_match(&title.to_lowercase())
+    /// Whether a channel's toasts are muted by a recent `stream-down`.
+    /// Expired stamps are cleared on read. Unknown channels are never quiet.
+    fn quiet(&mut self, channel_id: u64) -> bool {
+        match self.channels.get_mut(&channel_id) {
+            Some((_, Some(until))) if Instant::now() < *until => true,
+            Some((_, quiet)) => {
+                *quiet = None;
+                false
+            }
+            None => false,
+        }
     }
 
     pub(crate) fn start_connect(&mut self) {
@@ -188,7 +200,7 @@ impl Worker {
     /// stream identity moved. Steady refreshes stay silent.
     pub(crate) fn track_channel(&mut self, user: http::ResolvedChannel) {
         let id = user.channel_id;
-        if should_log_stream(self.channels.get(&id), &user) {
+        if should_log_stream(self.channels.get(&id).map(|(user, _)| user), &user) {
             log::info!(
                 target: "hermes",
                 "stream {}({}): stream_id={} createdAt={}",
@@ -198,7 +210,10 @@ impl Worker {
                 user.stream_created_at.as_deref().unwrap_or("none"),
             );
         }
-        self.channels.insert(id, user);
+        // A fresh resolve replaces the baseline but keeps the mute stamp:
+        // reconnects must not re-arm notifications inside the window.
+        let quiet = self.channels.get(&id).and_then(|(_, quiet)| *quiet);
+        self.channels.insert(id, (user, quiet));
     }
 
     /// Registers a channel's two topics if not registered already. Entries
@@ -468,22 +483,28 @@ impl Worker {
         let old_game = pubsub["old_game"].as_str().unwrap_or_default();
         // Whether the new title trips the word filter; only title changes
         // are gated on it below.
-        let title_filtered = self.title_filtered(&status);
+        let title_filtered = {
+            let this = &self;
+            let title: &str = &status;
+            this.matcher.is_match(title)
+        };
         let (notify_titles, sound) = {
             let state = self.shared.read();
             (state.config.notify_title_changes, state.config.sound)
         };
         // The borrow ends before the toast queues: `queue_toast` needs
         // `&mut self` while the toast data below borrows the user.
+        // The quiet check runs first: it takes `&mut self`, so it cannot
+        // overlap the user borrow below.
+        let quiet = self.quiet(channel_id);
         let toast = {
-            let Some(user) = self.channels.get_mut(&channel_id) else {
+            let Some((user, _)) = self.channels.get_mut(&channel_id) else {
                 return;
             };
             let title_changed = user.stream_title.as_deref() != Some(status.as_str());
             let game_changed = game.as_deref() != user.game.as_ref().map(|game| game.name.as_str());
-            let can_notify = notify_titles && !user.live;
-            // Only title changes are filtered: a game-only update still notifies
-            // on a filtered title, while a retitle into one stays silent.
+            let can_notify = notify_titles && !user.live && !quiet;
+
             let filtered = title_changed && title_filtered;
             let toast = if can_notify && (title_changed || game_changed) && !filtered {
                 let mut lines = Vec::new();
@@ -540,7 +561,7 @@ impl Worker {
     fn on_video_playback(&mut self, channel_id: u64, pubsub: &Value) {
         match pubsub["type"].as_str() {
             Some("viewcount") => {
-                if let Some(user) = self.channels.get_mut(&channel_id) {
+                if let Some((user, _)) = self.channels.get_mut(&channel_id) {
                     user.viewers = pubsub["viewers"]
                         .as_u64()
                         .and_then(|x| u32::try_from(x).ok());
@@ -555,7 +576,10 @@ impl Worker {
             }
             Some("stream-up") => {
                 // Notify from the cached baseline first; refresh from gql after.
-                let cached = self.channels.get_mut(&channel_id).map(|user| {
+                // A restream inside the offline window stays silent: state
+                // still flips live and refreshes, only the toast is skipped.
+                let quiet = self.quiet(channel_id);
+                let cached = self.channels.get_mut(&channel_id).map(|(user, _)| {
                     user.live = true;
                     (
                         user.channel_name.clone(),
@@ -580,7 +604,12 @@ impl Worker {
                 if !wanted && cached.is_none() {
                     return;
                 }
-                if let Some((login, display_name, game, title, avatar)) = cached {
+                if quiet {
+                    log::info!(
+                        target: "hermes",
+                        "stream-up for {channel_id} inside offline window, staying silent"
+                    );
+                } else if let Some((login, display_name, game, title, avatar)) = cached {
                     self.notify_live(
                         &display_name,
                         game.as_ref(),
@@ -595,7 +624,10 @@ impl Worker {
                 }));
             }
             Some("stream-down") => {
-                if let Some(user) = self.channels.get_mut(&channel_id) {
+                if let Some((user, quiet)) = self.channels.get_mut(&channel_id) {
+                    // Muting lives next to the live flag it guards, so a
+                    // quick restream stays silent.
+                    *quiet = Some(Instant::now() + OFFLINE_QUIET);
                     user.live = false;
                     user.collaboration_viewers = None;
                     user.viewers = None;
@@ -632,7 +664,7 @@ impl Worker {
                     return;
                 };
                 user.live = true;
-                if !self.channels.contains_key(&channel_id) {
+                if !self.channels.contains_key(&channel_id) && !self.quiet(channel_id) {
                     let sound = self.shared.read().config.sound;
                     let display_name = user.channel_display_name.clone();
                     let game = user.game.clone();
@@ -687,15 +719,11 @@ impl Worker {
 /// Whether a fresh resolve deserves a stream log: first sight logs only
 /// when the request carried stream data, later resolves log only when the
 /// stream identity moved.
-fn should_log_stream(
-    old: Option<&http::ResolvedChannel>,
-    new: &http::ResolvedChannel,
-) -> bool {
+fn should_log_stream(old: Option<&http::ResolvedChannel>, new: &http::ResolvedChannel) -> bool {
     match old {
         None => new.stream_created_at.is_some(),
         Some(prev) => {
-            prev.stream_id != new.stream_id
-                || prev.stream_created_at != new.stream_created_at
+            prev.stream_id != new.stream_id || prev.stream_created_at != new.stream_created_at
         }
     }
 }
@@ -725,15 +753,15 @@ mod tests {
     #[test]
     fn title_filter_matches_case_insensitively() {
         let worker = test_worker(&["offline"]);
-        assert!(worker.title_filtered("going OFFLINE for the night"));
-        assert!(worker.title_filtered("Offline"));
-        assert!(!worker.title_filtered("online and grinding ranked"));
+        assert!(worker.matcher.is_match("going OFFLINE for the night"));
+        assert!(worker.matcher.is_match("Offline"));
+        assert!(!worker.matcher.is_match("online and grinding ranked"));
     }
 
     #[test]
     fn title_filter_empty_word_list_matches_nothing() {
         let worker = test_worker(&[]);
-        assert!(!worker.title_filtered("offline"));
+        assert!(!worker.matcher.is_match("offline"));
     }
 
     fn resolved(stream_id: u64, created_at: Option<&str>) -> crate::http::ResolvedChannel {
@@ -756,14 +784,26 @@ mod tests {
     #[test]
     fn stream_log_baselines_only_with_data_and_changes_only() {
         // Startup baseline: log when the request carried stream data.
-        assert!(super::should_log_stream(None, &resolved(9, Some("2026-09-10T18:35:06Z"))));
+        assert!(super::should_log_stream(
+            None,
+            &resolved(9, Some("2026-09-10T18:35:06Z"))
+        ));
         assert!(!super::should_log_stream(None, &resolved(9, None)));
         // Steady refresh: identical identity stays silent.
         let live = resolved(9, Some("2026-09-10T18:35:06Z"));
-        assert!(!super::should_log_stream(Some(&live), &resolved(9, Some("2026-09-10T18:35:06Z"))));
+        assert!(!super::should_log_stream(
+            Some(&live),
+            &resolved(9, Some("2026-09-10T18:35:06Z"))
+        ));
         // New stream id or timestamp logs, including going offline.
-        assert!(super::should_log_stream(Some(&live), &resolved(10, Some("2026-09-10T18:35:06Z"))));
-        assert!(super::should_log_stream(Some(&live), &resolved(9, Some("2026-09-11T18:35:06Z"))));
+        assert!(super::should_log_stream(
+            Some(&live),
+            &resolved(10, Some("2026-09-10T18:35:06Z"))
+        ));
+        assert!(super::should_log_stream(
+            Some(&live),
+            &resolved(9, Some("2026-09-11T18:35:06Z"))
+        ));
         assert!(super::should_log_stream(Some(&live), &resolved(9, None)));
     }
 }

@@ -190,7 +190,9 @@ impl Worker {
             UiIntent::ApplyUpdate => {
                 self.handle_apply_update();
             }
-            UiIntent::ClearError => self.clear_error(),
+            UiIntent::ClearError => self.shared.update(|state| {
+                state.error.clear();
+            }),
         }
     }
 

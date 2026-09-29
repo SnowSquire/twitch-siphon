@@ -1,11 +1,18 @@
 use std::collections::VecDeque;
 
+// Byte-exact multi-pattern matcher (Aho-Corasick DFA). ASCII case is
+// folded at the boundary — patterns on the way in, text bytes on the
+// way through — so checks never allocate and non-ASCII bytes pass
+// through untouched.
 pub struct Matcher {
-    // transitions[node * alphabet_size + symbol]
+    // transitions[node * stride + symbol]; the stride is the alphabet
+    // size padded to a power of two so indexing shifts, and symbol ids
+    // stay dense below the alphabet size.
     transitions: Vec<u32>,
     output: Vec<bool>,
     alphabet: [usize; 256],
     alphabet_size: usize,
+    stride_shift: u32,
 }
 
 impl Matcher {
@@ -13,10 +20,10 @@ impl Matcher {
         let mut alphabet = [usize::MAX; 256];
         let mut alphabet_size = 0;
 
-        // Compress the byte alphabet to only bytes used by patterns.
+        // Compress the byte alphabet to only folded bytes used by patterns.
         for pattern in patterns {
             for &byte in pattern.as_bytes() {
-                let slot = &mut alphabet[byte as usize];
+                let slot = &mut alphabet[byte.to_ascii_lowercase() as usize];
 
                 if *slot == usize::MAX {
                     *slot = alphabet_size;
@@ -25,14 +32,21 @@ impl Matcher {
             }
         }
 
+        // Pad the row stride to a power of two so node indexing shifts
+        // instead of multiplying on the hot path.
+        let stride = alphabet_size.next_power_of_two().max(1);
+        let stride_shift = stride.trailing_zeros();
+        debug_assert!(stride.is_power_of_two());
+
         let mut matcher = Self {
-            transitions: vec![0; alphabet_size],
+            transitions: vec![0; stride],
             output: vec![false],
             alphabet,
             alphabet_size,
+            stride_shift,
         };
 
-        // Build the trie.
+        // Build the trie over folded bytes.
         for pattern in patterns {
             let mut node = 0usize;
 
@@ -42,17 +56,15 @@ impl Matcher {
             }
 
             for &byte in pattern.as_bytes() {
-                let symbol = matcher.alphabet[byte as usize];
-                let index = node * alphabet_size + symbol;
+                let symbol = matcher.alphabet[byte.to_ascii_lowercase() as usize];
+                let index = (node << stride_shift) + symbol;
                 let next = matcher.transitions[index];
 
                 if next == 0 {
                     let new_node = matcher.output.len() as u32;
 
                     matcher.output.push(false);
-                    matcher
-                        .transitions
-                        .extend(std::iter::repeat_n(0, alphabet_size));
+                    matcher.transitions.extend(std::iter::repeat_n(0, stride));
 
                     matcher.transitions[index] = new_node;
                     node = new_node as usize;
@@ -85,11 +97,11 @@ impl Matcher {
             let fail_node = failure[node] as usize;
 
             for symbol in 0..alphabet_size {
-                let index = node * alphabet_size + symbol;
+                let index = (node << stride_shift) + symbol;
                 let child = matcher.transitions[index];
 
                 if child != 0 {
-                    let fallback = matcher.transitions[fail_node * alphabet_size + symbol];
+                    let fallback = matcher.transitions[(fail_node << stride_shift) + symbol];
 
                     failure[child as usize] = fallback;
 
@@ -102,7 +114,7 @@ impl Matcher {
                 } else {
                     // Complete the DFA transition table.
                     matcher.transitions[index] =
-                        matcher.transitions[fail_node * alphabet_size + symbol];
+                        matcher.transitions[(fail_node << stride_shift) + symbol];
                 }
             }
         }
@@ -122,7 +134,8 @@ impl Matcher {
         let mut state = 0usize;
 
         for &byte in text.as_bytes() {
-            let symbol = self.alphabet[byte as usize];
+            // Fold here instead of lowercasing the whole title upfront.
+            let symbol = self.alphabet[byte.to_ascii_lowercase() as usize];
 
             if symbol == usize::MAX {
                 // This byte cannot participate in any pattern.
@@ -130,7 +143,7 @@ impl Matcher {
                 continue;
             }
 
-            state = self.transitions[state * self.alphabet_size + symbol] as usize;
+            state = self.transitions[(state << self.stride_shift) + symbol] as usize;
 
             if self.output[state] {
                 return true;

@@ -95,7 +95,9 @@ fn main() {
                             tray_rx,
                             shared: work_frame,
                         });
-                        worker.publish();
+
+                        worker.shared.update(|_| {});
+
                         worker.push_update_check();
                         worker.run().await;
                     });
