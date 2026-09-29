@@ -19,8 +19,10 @@
 - Subscription acceptance is worker-private, not snapshot state: `sub_ids`
   maps each `Topic` to a `SubEntry` (`sub_id`, send-attempt counter,
   `Pending`/`Accepted`/`Rejected`). Every send arms one jobs-timeout
-  carrying (topic, sub-id, attempt); the timeout errors only on an exact
-  match still `Pending`, so stale deadlines can't fail newer attempts.
+  carrying (topic, sub-id, attempt); on an exact match still `Pending`
+  the timeout reconnects a live socket (backoff + welcome replay retry
+  the topic), or stays silent without one since a reconnect is already
+  underway — so stale deadlines can't disturb newer attempts.
   Rejections error immediately and never double-report. Entries are never
   dropped — retries ride the normal reconnect replay. Notifications
   require `Accepted`.

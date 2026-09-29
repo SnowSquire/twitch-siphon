@@ -435,8 +435,9 @@ impl Worker {
 
     /// Sends subscribes for already-registered topics and arms one
     /// confirmation deadline per topic: a timeout whose entry is still
-    /// `Pending` (same id, same send) surfaces an error and leaves the
-    /// entry for the reconnect replay to retry.
+    /// `Pending` (same id, same send) reconnects a live socket, so backoff
+    /// and the welcome replay retry it; without a socket a reconnect is
+    /// already underway.
     async fn subscribe(&mut self, pairs: &[(NanoId, Topic)]) {
         if !pairs.is_empty() {
             log::info!(
@@ -843,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_timeout_reports_only_still_pending_attempts() {
+    fn subscribe_timeout_silent_without_live_socket() {
         let mut worker = test_worker(&[]);
         worker.ensure_subs(7);
         let pairs = sub_pairs(&worker);
@@ -853,17 +854,15 @@ mod tests {
             (*topic, entry.sub_id, entry.attempt)
         };
 
-        // Still pending at the deadline: surfaces an error, entry kept.
+        // Still pending at the deadline, but no live socket: a reconnect
+        // is already underway, so the deadline stays silent and the entry
+        // is kept for its replay.
         check_due(&mut worker, topic, sub_id, attempt);
-        assert!(
-            worker.shared.read().error.contains("not confirmed"),
-            "was: {}",
-            worker.shared.read().error
-        );
+        assert!(worker.shared.read().error.is_empty());
         assert!(worker.sub_ids.contains_key(&topic));
+        assert_eq!(worker.reconnect_attempt, 0);
 
         // A confirmation silences even the already-fired deadline.
-        worker.shared.update(|state| state.error.clear());
         confirm(&mut worker, sub_id, true);
         check_due(&mut worker, topic, sub_id, attempt);
         assert!(worker.shared.read().error.is_empty());
@@ -876,12 +875,12 @@ mod tests {
         check_due(&mut worker, topic, sub_id, attempt);
         assert!(worker.shared.read().error.is_empty());
 
-        // The new deadline still guards the new attempt.
+        // The new deadline still guards the new attempt, silently.
         check_due(&mut worker, topic, sub_id, next);
-        assert!(worker.shared.read().error.contains("not confirmed"));
+        assert!(worker.shared.read().error.is_empty());
+        assert!(worker.sub_ids.contains_key(&topic));
 
         // A rejection surfaces immediately and exactly once.
-        worker.shared.update(|state| state.error.clear());
         confirm(&mut worker, sub_id, false);
         assert!(
             worker.shared.read().error.contains("rejected"),

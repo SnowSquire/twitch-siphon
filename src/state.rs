@@ -27,10 +27,7 @@ use crate::matcher::Matcher;
 use crate::notifier;
 use crate::tray::TrayAction;
 
-/// One imperative UI mutation. Sent GUI→work; the work thread applies it,
-/// persists it as a background job, and publishes the change.
-/// Adds carry only the login (the only thing the UI knows); removes carry
-/// the resolved id.
+/// One imperative UI mutation. Sent GUI→work.
 pub enum UiIntent {
     AddLogin(String),
     RemoveChannel(u64),
@@ -44,9 +41,8 @@ pub enum UiIntent {
 
 /// Everything the GUI needs for one frame. Single source of truth for
 /// presentation state: live rows live only here, mutated in place by
-/// the work thread under short write locks (never held across an
-/// `await`); the GUI clones the snapshot out when its seen version
-/// lags.
+/// the work thread under short write locks.
+/// The GUI clones the snapshot out when its seen version lags.
 #[derive(Clone)]
 pub struct Snapshot {
     pub config: Config,
@@ -82,24 +78,21 @@ impl Default for Snapshot {
 /// The channel is unbounded because tray actions are lossless; frame
 /// traffic is user actions and connection events, never a hot loop, so no
 /// backlog builds in practice.
-#[derive(Clone)]
 pub struct SharedSnapshot {
-    inner: Arc<RwLock<Snapshot>>,
-    version: Arc<AtomicU64>,
+    inner: RwLock<Snapshot>,
+    version: AtomicU64,
     tx: Sender<GuiEvent>,
 }
 
 impl SharedSnapshot {
-    /// Creates the slot plus the pump wakeups: the receiver belongs to the
-    /// foreground pump awaiting [`GuiEvent`]s.
-    pub fn pair(state: Snapshot) -> (Self, kanal::AsyncReceiver<GuiEvent>) {
+    pub fn pair(state: Snapshot) -> (Arc<Self>, kanal::AsyncReceiver<GuiEvent>) {
         let (tx, rx) = kanal::unbounded();
         (
-            Self {
-                inner: Arc::new(RwLock::new(state)),
-                version: Arc::new(AtomicU64::new(0)),
+            Arc::new(Self {
+                inner: RwLock::new(state),
+                version: AtomicU64::new(0),
                 tx,
-            },
+            }),
             rx.to_async(),
         )
     }
@@ -124,19 +117,12 @@ impl SharedSnapshot {
         result
     }
 
-    /// Borrows the slot. Short critical sections only: never hold the
-    /// guard across an `await` (clippy's `await_holding_lock` enforces
-    /// this). A poisoned lock still reads; the snapshot matters more than
-    /// the panic that poisoned it.
     pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Snapshot> {
         self.inner
             .read()
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    /// Current version, bumped by every [`SharedSnapshot::update`]. The pump
-    /// skips the clone when its seen version is current; a store racing
-    /// the check surfaces on the next pass via the accompanying poke.
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::Acquire)
     }
@@ -209,14 +195,14 @@ pub struct WorkerInit {
     pub config: Config,
     pub ui_rx: kanal::Receiver<UiIntent>,
     pub tray_rx: kanal::Receiver<TrayAction>,
-    pub shared: SharedSnapshot,
+    pub shared: Arc<SharedSnapshot>,
 }
 /// One Hermes pubsub registration: the server-issued id plus whether the
 /// server confirmed it. Entries persist across reconnects; every welcome
 /// replays the whole map, which resets confirmations until that
-/// connection's answers arrive. Timeouts and rejections surface through
-/// the snapshot error; entries are never dropped, so retries ride the
-/// normal reconnect replay.
+/// connection's answers arrive. Rejections surface through the snapshot
+/// error; unconfirmed sends reconnect a live socket so the replay retries
+/// them. Entries are never dropped.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubState {
     Pending,
@@ -244,7 +230,7 @@ pub(crate) struct SubEntry {
 /// held across an `await`.
 pub struct Worker {
     pub(crate) config_path: PathBuf,
-    pub(crate) shared: SharedSnapshot,
+    pub(crate) shared: Arc<SharedSnapshot>,
     pub(crate) ui_rx: kanal::AsyncReceiver<UiIntent>,
     pub(crate) tray_rx: kanal::AsyncReceiver<TrayAction>,
     pub(crate) quiet_until: HashMap<u64, Instant>,
@@ -520,15 +506,12 @@ mod tests {
                 compio::fs::remove_file(&path).await.ok();
                 worker.request_add_login(login.to_owned());
                 worker.jobs.clear();
-                let result: anyhow::Result<Option<http::ChannelDetail>> =
-                    if transport_error {
-                        Err(anyhow::anyhow!("boom"))
-                    } else {
-                        Ok(None)
-                    };
-                worker
-                    .complete_add_login(login.to_owned(), result)
-                    .await;
+                let result: anyhow::Result<Option<http::ChannelDetail>> = if transport_error {
+                    Err(anyhow::anyhow!("boom"))
+                } else {
+                    Ok(None)
+                };
+                worker.complete_add_login(login.to_owned(), result).await;
 
                 assert!(
                     compio::fs::metadata(&path).await.is_err(),

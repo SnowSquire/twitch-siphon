@@ -161,8 +161,15 @@ impl Worker {
                             && entry.state == SubState::Pending
                 );
                 if unconfirmed {
-                    log::info!(target: "hermes", "subscription to {topic} not confirmed");
-                    self.set_error(format!("subscription to {topic} not confirmed"));
+                    // A live socket with a dead topic never heals on its
+                    // own: run it through the socket reconnect so backoff
+                    // and the welcome replay retry the topic. Without a
+                    // socket a reconnect is already underway, which replays
+                    // everything.
+                    log::info!(target: "hermes", "subscription to {topic} not confirmed, reconnecting");
+                    if self.socket.is_some() {
+                        self.on_disconnect().await;
+                    }
                 }
             }
             JobDone::ConnectFinished(outcome) => {

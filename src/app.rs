@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use kanal::Sender;
 use windows_sys::Win32::UI::WindowsAndMessaging::HICON;
 use wgpui::{
@@ -30,7 +32,7 @@ enum Tab {
 /// on the view entity.
 pub struct ViewParams {
     pub ui_tx: Sender<UiIntent>,
-    pub shared: SharedSnapshot,
+    pub shared: Arc<SharedSnapshot>,
     pub gui_rx: kanal::AsyncReceiver<GuiEvent>,
     pub tray: Option<Tray>,
     pub single: app_single_instance::PrimaryHandle,
@@ -38,7 +40,7 @@ pub struct ViewParams {
 
 pub struct SiphonView {
     ui_tx: Sender<UiIntent>,
-    shared: SharedSnapshot,
+    shared: Arc<SharedSnapshot>,
     snapshot_version: u64,
     snapshot: Snapshot,
     login_input: Entity<InputState>,
@@ -183,7 +185,7 @@ fn windows_registry_mode() -> Option<ThemeMode> {
 /// clipboard apartment. The callback reads the reported mode and forwards
 /// it through the frame channel; the pump applies it directly, so
 /// there is no new channel, no new task, and no polling.
-pub fn watch_system_theme(frame: SharedSnapshot) {
+pub fn watch_system_theme(frame: Arc<SharedSnapshot>) {
     use windows::Foundation::TypedEventHandler;
     use windows::UI::ViewManagement::UISettings;
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
