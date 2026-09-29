@@ -12,7 +12,10 @@ edition = "2024"
 # `slint-build` in `build.rs`; `src/app.rs` only maps the worker `Snapshot`
 # onto properties and forwards callbacks as `UiIntent`s. Video later rides
 # `Image::try_from(wgpu::Texture)` zero-copy imports, never CPU copies.
-slint = "1.18"
+# `raw-window-handle-06` exposes the winit HWND so the minimize button can
+# hide to the tray; Slint gates `Window::window_handle` behind the feature.
+slint = { version = "1.18", features = ["raw-window-handle-06"] }
+raw-window-handle = "0.6"
 # Sync MPMC channels bridging the GUI thread and the work runtime.
 # Sole rustls crypto provider, enabled explicitly: hyper-rustls in wgpui's
 # tree used to switch `ring` on transitively, and provider auto-detection

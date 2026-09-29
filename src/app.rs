@@ -48,6 +48,7 @@ pub fn build(params: ViewParams) -> (AppWindow, Guards) {
         ui.set_dark(dark);
     }
     let has_tray = params.tray.is_some();
+    arm_minimize_to_tray(&ui, has_tray);
     ui.window().on_close_requested(move || {
         if has_tray {
             trim_working_set();
@@ -64,6 +65,109 @@ pub fn build(params: ViewParams) -> (AppWindow, Guards) {
         _single: params.single,
     };
     (ui, guards)
+}
+
+/// comctl subclass id for the minimize swallow below.
+const MINIMIZE_SUBCLASS_ID: usize = 1;
+/// Install attempts while the winit window does not exist yet.
+const MINIMIZE_HOOK_ATTEMPTS: u32 = 50;
+const MINIMIZE_HOOK_RETRY_IN: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Minimize button hides to the tray instead of the taskbar. Slint exposes
+/// no minimize event, so a comctl subclass swallows `SC_MINIMIZE` on the
+/// winit window. Skipped without a tray: hiding would strand the window
+/// invisible, same as the close handler above.
+fn arm_minimize_to_tray(ui: &AppWindow, has_tray: bool) {
+    if !has_tray {
+        return;
+    }
+    let weak = ui.as_weak();
+    // The HWND only exists once the backend runs the window, so the install
+    // defers past `run` and retries while the handle is unavailable.
+    slint::Timer::single_shot(MINIMIZE_HOOK_RETRY_IN, move || {
+        install_minimize_hook(&weak, MINIMIZE_HOOK_ATTEMPTS);
+    });
+}
+
+/// Installs the `SC_MINIMIZE` swallow, re-arming while the winit window does
+/// not exist yet. Runs on the GUI thread that owns the window.
+fn install_minimize_hook(weak: &slint::Weak<AppWindow>, attempts: u32) {
+    let Some(ui) = weak.upgrade() else { return };
+    let Some(hwnd) = slint_hwnd(&ui) else {
+        if attempts > 0 {
+            let weak = weak.clone();
+            slint::Timer::single_shot(MINIMIZE_HOOK_RETRY_IN, move || {
+                install_minimize_hook(&weak, attempts - 1);
+            });
+        } else {
+            log::info!(target: "app", "minimize-to-tray hook found no window");
+        }
+        return;
+    };
+    // SAFETY: `hwnd` is our own live winit window on this GUI thread; the
+    // subclass chains to winit's procedure and comctl drops it with the
+    // window, so the install outlives nothing.
+    let installed = unsafe {
+        windows_sys::Win32::UI::Shell::SetWindowSubclass(
+            hwnd,
+            Some(minimize_subclass),
+            MINIMIZE_SUBCLASS_ID,
+            0,
+        )
+    };
+    if installed == 0 {
+        log::info!(target: "app", "minimize-to-tray hook failed to install");
+    }
+}
+
+/// Raw Win32 handle of the Slint window. `None` until the backend runs the
+/// window, which is why the hook install defers past `run`.
+fn slint_hwnd(ui: &AppWindow) -> Option<windows_sys::Win32::Foundation::HWND> {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+
+    let provider = ui.window().window_handle();
+    let raw = provider.window_handle().ok()?;
+    match raw.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as _),
+        _ => None,
+    }
+}
+
+/// comctl subclass chained onto winit's procedure: `SC_MINIMIZE` hides to
+/// the tray instead of the taskbar. Installed only when a tray exists, so
+/// the swallow can never strand the window.
+unsafe extern "system" fn minimize_subclass(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+    _id: usize,
+    _data: usize,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    if is_minimize_command(msg, wparam) {
+        // SAFETY: our own live window; hiding only toggles visibility.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
+            )
+        };
+        trim_working_set();
+        log::info!(target: "tray", "minimize hid to tray");
+        return 0;
+    }
+    // SAFETY: default subclass chaining for everything else.
+    unsafe {
+        windows_sys::Win32::UI::Shell::DefSubclassProc(hwnd, msg, wparam, lparam)
+    }
+}
+
+/// `WM_SYSCOMMAND` carries the command in the high bits of `wparam`; the low
+/// four are reserved for system use and must be masked off.
+fn is_minimize_command(msg: u32, wparam: usize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging as wam;
+
+    msg == wam::WM_SYSCOMMAND && wparam & 0xFFF0 == wam::SC_MINIMIZE as usize
 }
 
 /// Subscribes to the documented system theme notification. Runs on the work
@@ -416,7 +520,30 @@ fn trim_working_set() {
 
 #[cfg(test)]
 mod tests {
-    use super::format_stream_start;
+    use super::{format_stream_start, is_minimize_command};
+
+    #[test]
+    fn minimize_command_masks_sys_bits() {
+        use windows_sys::Win32::UI::WindowsAndMessaging as wam;
+
+        assert!(is_minimize_command(
+            wam::WM_SYSCOMMAND,
+            wam::SC_MINIMIZE as usize
+        ));
+        // Low four bits are system-reserved, so a flagged minimize still hides.
+        assert!(is_minimize_command(
+            wam::WM_SYSCOMMAND,
+            wam::SC_MINIMIZE as usize | 0x000F
+        ));
+        assert!(!is_minimize_command(
+            wam::WM_SYSCOMMAND,
+            wam::SC_CLOSE as usize
+        ));
+        assert!(!is_minimize_command(
+            wam::WM_CLOSE,
+            wam::SC_MINIMIZE as usize
+        ));
+    }
 
     #[test]
     fn stream_start_formats_utc() {
