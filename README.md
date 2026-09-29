@@ -1,5 +1,7 @@
 # Siphon
 
+[![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/master/logo/MadeWithSlint-logo-whitebg.png)](https://slint.dev/)
+
 Never miss a stream. Siphon watches your favorite Twitch streamers and pops up
 a notification the moment one goes live. Click it (or the **Watch** button) to
 open the stream in your browser. It can also notify you when a channel changes

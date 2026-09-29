@@ -131,6 +131,12 @@ jobs:
         with:
           tag_name: ${{ needs.setup.outputs.tag }}
           name: ${{ needs.setup.outputs.title }}
+          # Slint royalty-free license attribution: the badge must be easily
+          # found where the binaries download, so it rides the release body.
+          body: |
+            **Recommended: the installer (`.msi`).** Installs just for you, no admin needed. Prefer portable? Grab the `Siphon_*_x64-portable.exe` instead.
+
+            [![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/master/logo/MadeWithSlint-logo-whitebg.png)](https://slint.dev/)
           files: |
             windows-bin/Siphon_*-portable.exe
             target/release/*.msi
